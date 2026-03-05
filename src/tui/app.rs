@@ -79,10 +79,7 @@ pub struct App {
     sender_colors: HashMap<String, Color>,
     next_color_idx: usize,
 
-    // Search
-    search_highlight: String, // active search term to highlight in message view
-
-    // Message content cache for search
+    // Message content cache
     cached_snippets: HashMap<String, Vec<String>>,
 
     // Polling
@@ -144,7 +141,6 @@ impl App {
             my_name: String::new(),
             sender_colors: HashMap::new(),
             next_color_idx: 0,
-            search_highlight: String::new(),
             cached_snippets: HashMap::new(),
             tick_count: 0,
             last_message_ids: HashMap::new(),
@@ -464,12 +460,6 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ),
         ];
-        if !self.search_highlight.is_empty() {
-            header_spans.push(Span::styled(
-                format!("  [search: {}]", self.search_highlight),
-                Style::default().fg(Color::Yellow),
-            ));
-        }
         let header = Paragraph::new(Line::from(header_spans));
         frame.render_widget(header, header_area);
 
@@ -771,12 +761,12 @@ impl App {
                 KeyCode::Char('q') => self.exit = true,
                 KeyCode::Char('j') | KeyCode::Down => {
                     self.sidebar_next();
-                    self.search_highlight.clear();
+
                     self.preview_selected().await;
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
                     self.sidebar_prev();
-                    self.search_highlight.clear();
+
                     self.preview_selected().await;
                 }
                 KeyCode::Char('r') => {
@@ -785,9 +775,7 @@ impl App {
                 }
                 KeyCode::Char('e') => self.load_email_folders().await,
                 KeyCode::Char('/') => {
-                    if let Some((path, line)) = self.spawn_tv() {
-                        self.navigate_to_tv_selection(&path, line).await;
-                    }
+                    self.spawn_tv();
                 }
                 KeyCode::Right | KeyCode::Char('l') => {
                     if self.current_conv_id.is_some() || self.current_email_id.is_some() {
@@ -808,7 +796,7 @@ impl App {
                         for i in (start + 1)..self.sidebar_items.len() {
                             if matches!(self.sidebar_items[i], SidebarItem::Conv(_) | SidebarItem::Email(_)) {
                                 self.sidebar_state.select(Some(i));
-                                self.search_highlight.clear();
+            
                                 self.preview_selected().await;
                                 break;
                             }
@@ -833,7 +821,7 @@ impl App {
                         for i in (start + 1)..self.sidebar_items.len() {
                             if matches!(self.sidebar_items[i], SidebarItem::Conv(_) | SidebarItem::Email(_)) {
                                 self.sidebar_state.select(Some(i));
-                                self.search_highlight.clear();
+            
                                 self.preview_selected().await;
                                 break;
                             }
@@ -873,11 +861,7 @@ impl App {
             },
             Focus::Messages => match key {
                 KeyCode::Esc => {
-                    if !self.search_highlight.is_empty() {
-                        self.search_highlight.clear();
-                    } else {
-                        self.focus = Focus::Sidebar;
-                    }
+                    self.focus = Focus::Sidebar;
                 }
                 KeyCode::Left | KeyCode::Char('h') => {
                     self.focus = Focus::Sidebar;
@@ -920,9 +904,7 @@ impl App {
                 }
                 KeyCode::Char('r') => self.load_messages().await,
                 KeyCode::Char('/') => {
-                    if let Some((path, line)) = self.spawn_tv() {
-                        self.navigate_to_tv_selection(&path, line).await;
-                    }
+                    self.spawn_tv();
                 }
                 _ => {}
             },
@@ -974,7 +956,7 @@ impl App {
                     if item_idx < self.sidebar_items.len() {
                         if matches!(self.sidebar_items[item_idx], SidebarItem::Conv(_) | SidebarItem::Email(_)) {
                             self.sidebar_state.select(Some(item_idx));
-                            self.search_highlight.clear();
+        
                             self.preview_selected().await;
                         }
                     }
@@ -1571,7 +1553,7 @@ impl App {
     }
 
     /// Suspend TUI, spawn tv for search, return selected file path and line number
-    fn spawn_tv(&self) -> Option<(String, Option<usize>)> {
+    fn spawn_tv(&mut self) {
         use std::process::Command;
 
         let data_dir = self.auth.config_dir().join("data");
@@ -1585,20 +1567,20 @@ impl App {
         );
         let _ = crossterm::terminal::disable_raw_mode();
 
-        // Spawn tv with rg as source
+        // Spawn tv with rg as source, preview shows the matched file
         let source_cmd = format!(
             "rg . --no-heading --line-number --color=never {}",
             data_path
         );
-        let result = Command::new("tv")
+        let _ = Command::new("tv")
             .arg("--source-command")
             .arg(&source_cmd)
             .arg("--preview-command")
             .arg("teamsh preview '{}'")
             .stdin(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
-            .output();
+            .status();
 
         // Resume TUI
         let _ = crossterm::terminal::enable_raw_mode();
@@ -1608,85 +1590,8 @@ impl App {
             crossterm::event::EnableMouseCapture,
         );
 
-        match result {
-            Ok(output) => {
-                let selection = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if selection.is_empty() {
-                    return None;
-                }
-                // Parse: path/to/file.txt:line_number:matched_text
-                let parts: Vec<&str> = selection.splitn(3, ':').collect();
-                let file_path = parts[0].to_string();
-                let line_num = parts.get(1).and_then(|s| s.parse::<usize>().ok());
-                Some((file_path, line_num))
-            }
-            Err(_e) => {
-                // tv not found or failed
-                None
-            }
-        }
-    }
-
-    async fn navigate_to_tv_selection(&mut self, file_path: &str, _line_num: Option<usize>) {
-        let parts: Vec<&str> = file_path.split('/').collect();
-
-        // Look for "conversations" in path
-        if let Some(pos) = parts.iter().position(|&p| p == "conversations") {
-            if let Some(conv_id_safe) = parts.get(pos + 1) {
-                let conv_id_safe = *conv_id_safe;
-                // Find conversation by matching safe_filename version of ID
-                for (i, conv) in self.conversations.iter().enumerate() {
-                    let safe = conv.id.replace('/', "_").replace('\\', "_").replace(':', "_")
-                        .replace('?', "_").replace('*', "_").replace('"', "_")
-                        .replace('<', "_").replace('>', "_").replace('|', "_");
-                    if safe == conv_id_safe || conv.id == conv_id_safe {
-                        let id = conv.id.clone();
-                        let topic = conv.display_name(&self.my_name);
-                        self.current_email_id = None;
-                        self.current_email_body = None;
-                        self.current_conv_id = Some(id.clone());
-                        self.current_conv_topic = topic;
-                        self.has_new_messages.insert(id.clone(), false);
-                        self.read_locally.insert(id, true);
-                        self.load_messages().await;
-                        self.scroll_offset = usize::MAX;
-                        self.focus = Focus::Messages;
-
-                        // Select in sidebar
-                        for (si, item) in self.sidebar_items.iter().enumerate() {
-                            if let SidebarItem::Conv(idx) = item {
-                                if *idx == i {
-                                    self.sidebar_state.select(Some(si));
-                                    break;
-                                }
-                            }
-                        }
-                        return;
-                    }
-                }
-            }
-        }
-
-        // Look for "emails" in path
-        if let Some(pos) = parts.iter().position(|&p| p == "emails") {
-            if parts.get(pos + 2).is_some() {
-                let email_file = parts[pos + 2];
-                let email_id_safe = email_file.trim_end_matches(".txt");
-                for (i, email) in self.emails.iter().enumerate() {
-                    let eid = email.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                    let safe = eid.replace('/', "_").replace('\\', "_").replace(':', "_")
-                        .replace('?', "_").replace('*', "_").replace('"', "_")
-                        .replace('<', "_").replace('>', "_").replace('|', "_");
-                    if safe == email_id_safe || eid == email_id_safe {
-                        self.preview_email(i).await;
-                        self.focus = Focus::Messages;
-                        return;
-                    }
-                }
-            }
-        }
-
-        self.status = "Could not find item from tv selection".to_string();
+        // Force full redraw after returning from tv
+        self.render_dirty = true;
     }
 
     async fn load_messages(&mut self) {
