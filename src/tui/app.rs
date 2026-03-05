@@ -52,6 +52,8 @@ pub struct App {
     conversations: Vec<Conversation>,
     sidebar_items: Vec<SidebarItem>,
     sidebar_state: ListState,
+    section_starts: Vec<usize>, // sidebar_items index where each section header is
+    favourites: Vec<String>,    // favourite conv/email IDs
 
     // Messages
     current_conv_id: Option<String>,
@@ -117,6 +119,8 @@ impl App {
             conversations: Vec::new(),
             sidebar_items: Vec::new(),
             sidebar_state: ListState::default(),
+            section_starts: Vec::new(),
+            favourites: Vec::new(),
             current_conv_id: None,
             current_conv_topic: String::new(),
             messages: Vec::new(),
@@ -167,6 +171,14 @@ impl App {
 
         // Load emails in background (don't block startup)
         app.load_emails().await;
+
+        // Load favourites from store
+        if let Ok(store) = crate::store::Store::new(app.auth.config_dir()) {
+            if let Ok(favs) = store.load_favourites() {
+                app.favourites = favs;
+            }
+        }
+
         Ok(app)
     }
 
@@ -526,8 +538,8 @@ impl App {
         // Help
         let help = match self.focus {
             Focus::Input => " Enter:send  Esc:cancel ",
-            Focus::Messages => " j/k:scroll  PgUp/Dn  G:end  g:top  Tab:sidebar  i:compose  /:search  r:refresh ",
-            _ => " Tab:messages  i:compose  /:search  r:refresh  e:emails  q:quit ",
+            Focus::Messages => " j/k:scroll  PgUp/Dn  G:end  g:top  h:sidebar  i:compose  /:search  r:refresh ",
+            _ => " Tab:section  j/k:nav  l:messages  /:search  f:fav  r:refresh  e:emails  q:quit ",
         };
         let help_widget = Paragraph::new(
             Line::from(help).style(Style::default().fg(Color::DarkGray)),
@@ -871,9 +883,77 @@ impl App {
                         self.navigate_to_tv_selection(&path, line).await;
                     }
                 }
-                KeyCode::Tab | KeyCode::Right => {
+                KeyCode::Right | KeyCode::Char('l') => {
                     if self.current_conv_id.is_some() || self.current_email_id.is_some() {
                         self.focus = Focus::Messages;
+                    }
+                }
+                KeyCode::Tab => {
+                    if !self.section_starts.is_empty() {
+                        let selected = self.sidebar_state.selected().unwrap_or(0);
+                        let mut current_sec = 0;
+                        for (i, &start) in self.section_starts.iter().enumerate() {
+                            if selected >= start {
+                                current_sec = i;
+                            }
+                        }
+                        let next_sec = (current_sec + 1) % self.section_starts.len();
+                        let start = self.section_starts[next_sec];
+                        for i in (start + 1)..self.sidebar_items.len() {
+                            if matches!(self.sidebar_items[i], SidebarItem::Conv(_) | SidebarItem::Email(_)) {
+                                self.sidebar_state.select(Some(i));
+                                self.search_highlight.clear();
+                                self.preview_selected().await;
+                                break;
+                            }
+                        }
+                    }
+                }
+                KeyCode::BackTab => {
+                    if !self.section_starts.is_empty() {
+                        let selected = self.sidebar_state.selected().unwrap_or(0);
+                        let mut current_sec = 0;
+                        for (i, &start) in self.section_starts.iter().enumerate() {
+                            if selected >= start {
+                                current_sec = i;
+                            }
+                        }
+                        let prev_sec = if current_sec == 0 {
+                            self.section_starts.len() - 1
+                        } else {
+                            current_sec - 1
+                        };
+                        let start = self.section_starts[prev_sec];
+                        for i in (start + 1)..self.sidebar_items.len() {
+                            if matches!(self.sidebar_items[i], SidebarItem::Conv(_) | SidebarItem::Email(_)) {
+                                self.sidebar_state.select(Some(i));
+                                self.search_highlight.clear();
+                                self.preview_selected().await;
+                                break;
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char('f') => {
+                    if let Some(selected) = self.sidebar_state.selected() {
+                        let id = match &self.sidebar_items[selected] {
+                            SidebarItem::Conv(idx) => Some(self.conversations[*idx].id.clone()),
+                            SidebarItem::Email(idx) => self.emails.get(*idx)
+                                .and_then(|e| e.get("id").and_then(|v| v.as_str()))
+                                .map(|s| s.to_string()),
+                            _ => None,
+                        };
+                        if let Some(id) = id {
+                            if let Some(pos) = self.favourites.iter().position(|f| f == &id) {
+                                self.favourites.remove(pos);
+                            } else {
+                                self.favourites.push(id);
+                            }
+                            if let Ok(store) = crate::store::Store::new(self.auth.config_dir()) {
+                                let _ = store.save_favourites(&self.favourites);
+                            }
+                            self.rebuild_sidebar();
+                        }
                     }
                 }
                 KeyCode::Char('i') => {
@@ -888,12 +968,15 @@ impl App {
                 _ => {}
             },
             Focus::Messages => match key {
-                KeyCode::Esc | KeyCode::Left => {
+                KeyCode::Esc => {
                     if !self.search_highlight.is_empty() {
                         self.search_highlight.clear();
                     } else {
                         self.focus = Focus::Sidebar;
                     }
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    self.focus = Focus::Sidebar;
                 }
                 KeyCode::Tab => {
                     self.focus = Focus::Sidebar;
@@ -1088,8 +1171,8 @@ impl App {
         }
     }
 
-    /// Rebuild sidebar_items from conversations, grouped by kind.
-    /// DMs first, then Channels, then Meetings. Each sorted by version (latest first).
+    /// Rebuild sidebar_items from conversations, grouped by section.
+    /// Sections: Favourites, Activity, DMs, Channels, Meetings, Emails.
     fn rebuild_sidebar(&mut self) {
         // Remember currently selected conv ID so we can restore it
         let prev_selected_id = self.selected_conversation_idx()
@@ -1108,29 +1191,93 @@ impl App {
             }
         }
 
-        // Each group is already sorted by version from load_conversations
-        let mut items = Vec::new();
+        let mut items: Vec<SidebarItem> = Vec::new();
+        let mut section_starts: Vec<usize> = Vec::new();
 
+        // Helper: collect favourite conv indices and email indices
+        let fav_conv_indices: Vec<usize> = self.conversations.iter().enumerate()
+            .filter(|(_, c)| self.favourites.contains(&c.id))
+            .map(|(i, _)| i)
+            .collect();
+        let fav_email_indices: Vec<usize> = self.emails.iter().enumerate()
+            .filter(|(_, e)| {
+                e.get("id").and_then(|v| v.as_str())
+                    .map(|id| self.favourites.contains(&id.to_string()))
+                    .unwrap_or(false)
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        // 1. Favourites
+        if !fav_conv_indices.is_empty() || !fav_email_indices.is_empty() {
+            section_starts.push(items.len());
+            let count = fav_conv_indices.len() + fav_email_indices.len();
+            items.push(SidebarItem::Header(format!("Favourites ({})", count)));
+            for idx in &fav_conv_indices {
+                items.push(SidebarItem::Conv(*idx));
+            }
+            for idx in &fav_email_indices {
+                items.push(SidebarItem::Email(*idx));
+            }
+        }
+
+        // 2. Activity - conversations with new messages (up to 10)
+        let mut activity: Vec<usize> = self.conversations.iter().enumerate()
+            .filter(|(_, c)| {
+                self.has_new_messages.get(&c.id).copied().unwrap_or(false)
+                    && !self.favourites.contains(&c.id)
+            })
+            .map(|(i, _)| i)
+            .take(10)
+            .collect();
+        // Also include unread (not read locally) that aren't favourites
+        if activity.len() < 10 {
+            for (i, conv) in self.conversations.iter().enumerate() {
+                if activity.len() >= 10 { break; }
+                let read_local = self.read_locally.get(&conv.id).copied().unwrap_or(false);
+                if !read_local && conv.is_unread() && !self.favourites.contains(&conv.id) && !activity.contains(&i) {
+                    activity.push(i);
+                }
+            }
+        }
+        if !activity.is_empty() {
+            section_starts.push(items.len());
+            items.push(SidebarItem::Header(format!("Activity ({})", activity.len())));
+            for idx in activity {
+                items.push(SidebarItem::Conv(idx));
+            }
+        }
+
+        // 3. DMs
         if !dms.is_empty() {
+            section_starts.push(items.len());
             items.push(SidebarItem::Header(format!("Direct Messages ({})", dms.len())));
             for idx in dms {
                 items.push(SidebarItem::Conv(idx));
             }
         }
+
+        // 4. Channels
         if !channels.is_empty() {
+            section_starts.push(items.len());
             items.push(SidebarItem::Header(format!("Channels ({})", channels.len())));
             for idx in channels {
                 items.push(SidebarItem::Conv(idx));
             }
         }
+
+        // 5. Meetings
         if !meetings.is_empty() {
+            section_starts.push(items.len());
             items.push(SidebarItem::Header(format!("Meetings ({})", meetings.len())));
             for idx in meetings {
                 items.push(SidebarItem::Conv(idx));
             }
         }
 
+        // 6. Emails
         if !self.emails.is_empty() {
+            section_starts.push(items.len());
             items.push(SidebarItem::Header(format!("Emails ({})", self.emails.len())));
             for idx in 0..self.emails.len() {
                 items.push(SidebarItem::Email(idx));
@@ -1138,6 +1285,7 @@ impl App {
         }
 
         self.sidebar_items = items;
+        self.section_starts = section_starts;
 
         // Restore selection by conv/email ID, or select first item
         let mut restored = false;
@@ -1170,7 +1318,7 @@ impl App {
         }
         if !restored {
             for (i, item) in self.sidebar_items.iter().enumerate() {
-                if matches!(item, SidebarItem::Conv(_)) {
+                if matches!(item, SidebarItem::Conv(_) | SidebarItem::Email(_)) {
                     self.sidebar_state.select(Some(i));
                     break;
                 }
