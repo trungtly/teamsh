@@ -13,6 +13,7 @@ use crate::api::Api;
 use crate::auth::Auth;
 use crate::cache::{Cache, CachedConv};
 use crate::html;
+use crate::store;
 use crate::types::{Conversation, ConvKind, Message};
 
 const SENDER_COLORS: [Color; 8] = [
@@ -45,6 +46,7 @@ enum SidebarItem {
 pub struct App {
     auth: Auth,
     api: Api,
+    store: store::Store,
     focus: Focus,
     exit: bool,
 
@@ -123,10 +125,12 @@ impl App {
     pub async fn new() -> Result<Self> {
         let auth = Auth::new()?;
         let api = Api::new(&auth.region());
+        let store = store::Store::new(auth.config_dir())?;
 
         let mut app = Self {
             auth,
             api,
+            store,
             focus: Focus::Sidebar,
             exit: false,
             conversations: Vec::new(),
@@ -193,10 +197,8 @@ impl App {
         app.load_email_folders().await;
 
         // Load favourites from store
-        if let Ok(store) = crate::store::Store::new(app.auth.config_dir()) {
-            if let Ok(favs) = store.load_favourites() {
-                app.favourites = favs;
-            }
+        if let Ok(favs) = app.store.load_favourites() {
+            app.favourites = favs;
         }
 
         Ok(app)
@@ -1006,9 +1008,7 @@ impl App {
                             } else {
                                 self.favourites.push(id);
                             }
-                            if let Ok(store) = crate::store::Store::new(self.auth.config_dir()) {
-                                let _ = store.save_favourites(&self.favourites);
-                            }
+                            let _ = self.store.save_favourites(&self.favourites);
                             self.rebuild_sidebar();
                         }
                     }
@@ -1740,6 +1740,36 @@ impl App {
 
                 // Save to cache for next startup
                 self.save_to_cache();
+
+                // Write to local file store
+                let mut conv_index = Vec::new();
+                for conv in &self.conversations {
+                    let kind = conv.kind();
+                    if matches!(kind, ConvKind::System) { continue; }
+                    let meta = store::ConvMeta {
+                        name: conv.display_name(&self.my_name),
+                        kind: format!("{:?}", kind),
+                        members: conv.member_names.clone(),
+                        unread: conv.is_unread(),
+                        version: conv.version.unwrap_or(0),
+                        last_message_id: conv.last_message.as_ref().and_then(|lm| lm.id.clone()),
+                        consumptionhorizon: conv.properties.as_ref().and_then(|p| p.consumptionhorizon.clone()),
+                    };
+                    let _ = self.store.save_conv_meta(&conv.id, &meta);
+                    conv_index.push(store::ConvIndex {
+                        id: conv.id.clone(),
+                        name: conv.display_name(&self.my_name),
+                        kind: format!("{:?}", kind),
+                        last_activity: conv.version.unwrap_or(0),
+                        unread: conv.is_unread(),
+                    });
+                }
+                let index = store::Index {
+                    my_name: self.my_name.clone(),
+                    conversations: conv_index,
+                    email_folders: Vec::new(), // emails synced separately
+                };
+                let _ = self.store.save_index(&index);
             }
             Err(e) => {
                 self.status = format!("Error: {}", e);
@@ -1893,6 +1923,16 @@ impl App {
                     }
                     self.messages = msgs;
                     self.render_dirty = true;
+                    // Write messages to local files
+                    if let Some(conv_id) = &self.current_conv_id {
+                        for m in &self.messages {
+                            let msg_id = m.id.as_deref().unwrap_or("unknown");
+                            let sender = m.imdisplayname.as_deref().unwrap_or("?");
+                            let timestamp = m.timestamp.as_deref().unwrap_or("");
+                            let content = m.content.as_deref().unwrap_or("");
+                            let _ = self.store.save_message(conv_id, msg_id, timestamp, sender, content);
+                        }
+                    }
                 }
                 Err(e) => {
                     self.status = format!("Error: {}", e);
