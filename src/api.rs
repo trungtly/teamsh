@@ -2,6 +2,31 @@ use anyhow::{Context, Result};
 use crate::auth::Auth;
 use crate::types::{ConversationsResponse, MessagesResponse};
 
+/// Generate a random UUID v4 string
+fn uuid_v4() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    // Simple pseudo-random UUID v4
+    let mut bytes = [0u8; 16];
+    let mut s = seed;
+    for b in bytes.iter_mut() {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+        *b = (s >> 33) as u8;
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 1
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11],
+        bytes[12], bytes[13], bytes[14], bytes[15],
+    )
+}
+
 const BASE_URL: &str = "https://teams.cloud.microsoft/api/chatsvc";
 
 pub struct Api {
@@ -101,6 +126,83 @@ impl Api {
             }
         }
         Ok(results)
+    }
+
+    /// Register endpoint and set presence to Available (green)
+    pub async fn set_available(&self, auth: &mut Auth, hours: u64) -> Result<()> {
+        let token = auth.access_token().await?;
+        let ups_base = format!("https://teams.cloud.microsoft/ups/{}", self.region);
+        let endpoint_id = uuid_v4();
+
+        // Step 1: Register endpoint
+        let reg_url = format!("{}/v1/me/endpoints/", ups_base);
+        let reg_body = serde_json::json!({
+            "id": endpoint_id,
+            "availability": "Available",
+            "activity": "Available",
+            "activityReporting": "Transport",
+            "deviceType": "Web",
+        });
+        let resp = self.client
+            .put(&reg_url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("behavioroverride", "redirectAs404")
+            .header("x-ms-client-user-agent", "Teams-V2-Web")
+            .json(&reg_body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Endpoint register failed ({}): {}", status, &text[..text.len().min(300)]);
+        }
+
+        // Step 2: Force availability
+        let force_url = format!("{}/v1/me/forceavailability/", ups_base);
+        let expiry = chrono::Utc::now() + chrono::Duration::hours(hours as i64);
+        let force_body = serde_json::json!({
+            "availability": "Available",
+            "activity": "Available",
+            "expiry": expiry.to_rfc3339(),
+        });
+        let token = auth.access_token().await?;
+        let resp = self.client
+            .put(&force_url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("behavioroverride", "redirectAs404")
+            .header("x-ms-client-user-agent", "Teams-V2-Web")
+            .header("x-ms-endpoint-id", &endpoint_id)
+            .json(&force_body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Force availability failed ({}): {}", status, &text[..text.len().min(300)]);
+        }
+        Ok(())
+    }
+
+    /// Report activity to keep presence alive
+    pub async fn report_activity(&self, auth: &mut Auth) -> Result<()> {
+        let token = auth.access_token().await?;
+        let url = format!(
+            "https://teams.cloud.microsoft/ups/{}/v1/me/reportmyactivity/",
+            self.region
+        );
+        let resp = self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("behavioroverride", "redirectAs404")
+            .header("x-ms-client-user-agent", "Teams-V2-Web")
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Report activity failed ({}): {}", status, &text[..text.len().min(200)]);
+        }
+        Ok(())
     }
 
     async fn get<T: serde::de::DeserializeOwned>(&self, auth: &mut Auth, url: &str) -> Result<T> {

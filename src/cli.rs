@@ -53,6 +53,15 @@ pub enum Commands {
         /// Search query
         query: String,
     },
+    /// Set presence to Available (green) for N hours
+    Green {
+        /// Duration in hours (default: 8)
+        #[arg(default_value = "8")]
+        hours: u64,
+        /// Keep refreshing presence every 4 minutes
+        #[arg(long, short)]
+        keep: bool,
+    },
     /// Launch TUI mode
     Tui,
 }
