@@ -104,8 +104,15 @@ pub fn rich_to_spans(segments: &[RichSegment]) -> Vec<Span<'static>> {
         if seg.mention {
             style = style.fg(Color::Cyan).add_modifier(Modifier::BOLD);
         }
-        if seg.link_url.is_some() {
-            style = style.fg(Color::Blue).add_modifier(Modifier::UNDERLINED);
+        if let Some(url) = &seg.link_url {
+            // Show as markdown-style link: [text](url)
+            let text = seg.text.trim();
+            let display = if text == url || text.is_empty() {
+                url.clone()
+            } else {
+                format!("[{}]({})", text, url)
+            };
+            return Span::styled(display, style.fg(Color::Blue).add_modifier(Modifier::UNDERLINED));
         }
         Span::styled(seg.text.clone(), style)
     }).collect()

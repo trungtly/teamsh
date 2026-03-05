@@ -619,12 +619,8 @@ impl App {
                 .filter(|s| !s.is_empty())
                 .unwrap_or(if my_name.is_empty() { "You" } else { &my_name });
             let content = m.content.as_deref().unwrap_or("");
-            let time = m
-                .timestamp
-                .as_deref()
-                .unwrap_or("")
-                .get(11..16)
-                .unwrap_or("??:??");
+            let timestamp_raw = m.timestamp.as_deref().unwrap_or("");
+            let time = format_timestamp(timestamp_raw);
             let sender_color = self.sender_colors.get(sender).copied().unwrap_or(Color::Green);
             let is_me = !my_name.is_empty() && sender == my_name;
 
@@ -1844,4 +1840,22 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
         lines.push(current);
     }
     lines
+}
+
+/// Format ISO 8601 timestamp to "Mar 05 14:32" style.
+fn format_timestamp(ts: &str) -> String {
+    // Input: "2026-03-05T14:32:00.000Z"
+    if ts.len() < 16 {
+        return "??:??".to_string();
+    }
+    let month = match ts.get(5..7) {
+        Some("01") => "Jan", Some("02") => "Feb", Some("03") => "Mar",
+        Some("04") => "Apr", Some("05") => "May", Some("06") => "Jun",
+        Some("07") => "Jul", Some("08") => "Aug", Some("09") => "Sep",
+        Some("10") => "Oct", Some("11") => "Nov", Some("12") => "Dec",
+        _ => "???",
+    };
+    let day = ts.get(8..10).unwrap_or("??");
+    let time = ts.get(11..16).unwrap_or("??:??");
+    format!("{} {} {}", month, day, time)
 }
