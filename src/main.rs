@@ -39,6 +39,9 @@ async fn main() -> Result<()> {
         Some(Commands::Emails { last }) => {
             cmd_emails(*last).await?;
         }
+        Some(Commands::Sync) => {
+            cmd_sync().await?;
+        }
         Some(Commands::Tui) | None => {
             tui::run().await?;
         }
@@ -244,6 +247,153 @@ async fn cmd_emails(last: u32) -> Result<()> {
             eprintln!("Error: {}", e);
         }
     }
+    Ok(())
+}
+
+async fn cmd_sync() -> Result<()> {
+    let mut auth = auth::Auth::new()?;
+    let api = api::Api::new(&auth.region());
+    let store = store::Store::new(auth.config_dir())?;
+
+    // --- Conversations ---
+    eprintln!("Fetching conversations...");
+    let resp = api.list_conversations(&mut auth, 100).await?;
+    let mut convs = resp.conversations;
+    convs.sort_by(|a, b| b.version.cmp(&a.version));
+
+    // Detect own name: most frequent sender across last messages
+    let mut name_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for c in &convs {
+        if let Some(lm) = &c.last_message {
+            if let Some(name) = lm.imdisplayname.as_ref().or(lm.from_display_name.as_ref()) {
+                if !name.is_empty() {
+                    *name_counts.entry(name.clone()).or_default() += 1;
+                }
+            }
+        }
+    }
+    let my_name = name_counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(name, _)| name)
+        .unwrap_or_default();
+
+    let mut conv_indices: Vec<store::ConvIndex> = Vec::new();
+    let mut msg_count: usize = 0;
+
+    for conv in &convs {
+        let kind = conv.kind();
+        if matches!(kind, ConvKind::System) {
+            continue;
+        }
+
+        let name = conv.display_name(&my_name);
+        let kind_str = format!("{:?}", kind).to_lowercase();
+
+        let meta = store::ConvMeta {
+            name: name.clone(),
+            kind: kind_str.clone(),
+            members: conv.member_names.clone(),
+            unread: conv.is_unread(),
+            version: conv.version.unwrap_or(0),
+            last_message_id: conv.last_message.as_ref().and_then(|lm| lm.id.clone()),
+            consumptionhorizon: conv.properties.as_ref().and_then(|p| p.consumptionhorizon.clone()),
+        };
+        store.save_conv_meta(&conv.id, &meta)?;
+
+        // Fetch messages
+        match api.get_messages(&mut auth, &conv.id, 30).await {
+            Ok(msg_resp) => {
+                for m in &msg_resp.messages {
+                    if !matches!(m.messagetype.as_deref(), Some("RichText/Html") | Some("Text")) {
+                        continue;
+                    }
+                    let mid = m.id.as_deref().unwrap_or("unknown");
+                    let ts = m.timestamp.as_deref().unwrap_or("");
+                    let sender = m.imdisplayname.as_deref().unwrap_or("?");
+                    let content = m.content.as_deref().unwrap_or("");
+                    store.save_message(&conv.id, mid, ts, sender, content)?;
+                    msg_count += 1;
+                }
+            }
+            Err(e) => {
+                eprintln!("  Warning: messages for '{}': {}", name, e);
+            }
+        }
+
+        conv_indices.push(store::ConvIndex {
+            id: conv.id.clone(),
+            name,
+            kind: kind_str,
+            last_activity: conv.version.unwrap_or(0),
+            unread: conv.is_unread(),
+        });
+    }
+
+    // --- Emails ---
+    eprintln!("Fetching mail folders...");
+    let folders = api.list_mail_folders(&mut auth).await?;
+    let mut email_folder_indices: Vec<store::EmailFolderIndex> = Vec::new();
+    let mut email_count: usize = 0;
+
+    for folder in &folders {
+        let folder_name = folder.get("displayName").and_then(|v| v.as_str()).unwrap_or("Unknown");
+        let folder_id = folder.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let total = folder.get("totalItemCount").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        if total == 0 || folder_id.is_empty() {
+            continue;
+        }
+
+        match api.list_emails(&mut auth, folder_id, 25).await {
+            Ok(emails) => {
+                for email in &emails {
+                    let eid = email.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let subject = email.get("subject").and_then(|v| v.as_str()).unwrap_or("(no subject)");
+                    let from = email
+                        .get("from")
+                        .and_then(|v| v.get("emailAddress"))
+                        .map(|ea| {
+                            let name = ea.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            let addr = ea.get("address").and_then(|v| v.as_str()).unwrap_or("");
+                            if name.is_empty() { addr.to_string() } else { format!("{} <{}>", name, addr) }
+                        })
+                        .unwrap_or_else(|| "?".to_string());
+                    let date = email.get("receivedDateTime").and_then(|v| v.as_str()).unwrap_or("");
+                    let body = email.get("bodyPreview").and_then(|v| v.as_str()).unwrap_or("");
+                    store.save_email(folder_name, eid, &from, date, subject, body)?;
+                    email_count += 1;
+                }
+
+                email_folder_indices.push(store::EmailFolderIndex {
+                    name: folder_name.to_string(),
+                    id: folder_id.to_string(),
+                    count: emails.len(),
+                });
+            }
+            Err(e) => {
+                eprintln!("  Warning: emails for '{}': {}", folder_name, e);
+            }
+        }
+    }
+
+    // --- Save index ---
+    let index = store::Index {
+        my_name: my_name.clone(),
+        conversations: conv_indices,
+        email_folders: email_folder_indices,
+    };
+    store.save_index(&index)?;
+
+    eprintln!(
+        "Synced: {} conversations, {} messages, {} email folders, {} emails",
+        index.conversations.len(),
+        msg_count,
+        index.email_folders.len(),
+        email_count,
+    );
+    eprintln!("Data dir: {:?}", store.data_dir());
+
     Ok(())
 }
 
