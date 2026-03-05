@@ -62,6 +62,14 @@ pub enum Commands {
         #[arg(long, short)]
         keep: bool,
     },
+    /// List emails from inbox
+    Emails {
+        /// Number of emails to fetch
+        #[arg(long, default_value = "10")]
+        last: u32,
+    },
+    /// Sync conversations and emails to local files
+    Sync,
     /// Launch TUI mode
     Tui,
 }

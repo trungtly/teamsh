@@ -232,6 +232,28 @@ impl Api {
         Ok(emails)
     }
 
+    /// List all mail folders
+    pub async fn list_mail_folders(&self, auth: &mut Auth) -> Result<Vec<serde_json::Value>> {
+        let token = auth.graph_token().await?;
+        let url = "https://graph.microsoft.com/v1.0/me/mailFolders?$top=50";
+        let resp = self.client
+            .get(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            anyhow::bail!("List mail folders failed ({}): {}", status, &text[..text.len().min(300)]);
+        }
+        let data: serde_json::Value = serde_json::from_str(&text)?;
+        let folders = data.get("value")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(folders)
+    }
+
     /// Get a single email's full body
     pub async fn get_email(&self, auth: &mut Auth, message_id: &str) -> Result<serde_json::Value> {
         let token = auth.graph_token().await?;
