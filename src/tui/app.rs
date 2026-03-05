@@ -105,6 +105,11 @@ pub struct App {
     // New message indicator
     has_new_below: bool,
 
+    // Scroll acceleration
+    last_scroll_key: Option<KeyCode>,
+    scroll_repeat_count: u32,
+    last_scroll_time: std::time::Instant,
+
     // Emails (Microsoft Graph)
     email_folders: Vec<(String, String, Vec<serde_json::Value>)>, // (folder_name, folder_id, emails)
     emails: Vec<serde_json::Value>,
@@ -163,6 +168,9 @@ impl App {
             cached_rendered_lines: Vec::new(),
             render_dirty: true,
             has_new_below: false,
+            last_scroll_key: None,
+            scroll_repeat_count: 0,
+            last_scroll_time: std::time::Instant::now(),
         };
 
         // Try loading from cache first for instant startup
@@ -232,6 +240,18 @@ impl App {
         self.next_color_idx += 1;
         self.sender_colors.insert(name.to_string(), color);
         color
+    }
+
+    fn scroll_amount(&mut self, key: KeyCode) -> usize {
+        let now = std::time::Instant::now();
+        if self.last_scroll_key == Some(key) && now.duration_since(self.last_scroll_time).as_millis() < 200 {
+            self.scroll_repeat_count += 1;
+        } else {
+            self.scroll_repeat_count = 0;
+        }
+        self.last_scroll_key = Some(key);
+        self.last_scroll_time = now;
+        if self.scroll_repeat_count >= 3 { 3 } else { 1 }
     }
 
     // --- Drawing ---
@@ -1022,10 +1042,12 @@ impl App {
                     self.focus = Focus::Input;
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.scroll_offset = self.scroll_offset.saturating_add(1);
+                    let amount = self.scroll_amount(key);
+                    self.scroll_offset = self.scroll_offset.saturating_add(amount);
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                    let amount = self.scroll_amount(key);
+                    self.scroll_offset = self.scroll_offset.saturating_sub(amount);
                 }
                 KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
                     let half = self.view_height / 2;
