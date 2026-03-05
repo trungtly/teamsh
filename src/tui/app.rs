@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -59,6 +59,11 @@ pub struct App {
     messages: Vec<Message>,
     scroll_offset: usize,
     rendered_line_count: usize,
+    view_height: usize, // actual visible height for page scroll
+
+    // Layout areas (cached for mouse hit-testing)
+    sidebar_area: Rect,
+    msg_area: Rect,
 
     // Input
     input_buffer: String,
@@ -117,6 +122,9 @@ impl App {
             messages: Vec::new(),
             scroll_offset: 0,
             rendered_line_count: 0,
+            view_height: 20,
+            sidebar_area: Rect::default(),
+            msg_area: Rect::default(),
             input_buffer: String::new(),
             status: "Loading...".to_string(),
             my_name: String::new(),
@@ -166,15 +174,22 @@ impl App {
         while !self.exit {
             terminal.draw(|frame| self.draw(frame))?;
             if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        self.handle_key(key.code, key.modifiers).await;
+                match event::read()? {
+                    Event::Key(key) => {
+                        if key.kind == KeyEventKind::Press {
+                            self.handle_key(key.code, key.modifiers).await;
+                        }
                     }
+                    Event::Mouse(mouse) => {
+                        self.handle_mouse(mouse).await;
+                    }
+                    _ => {}
                 }
             }
 
             self.tick_count += 1;
-            if self.tick_count >= 300 {
+            // Poll every ~15 seconds (150 ticks * 100ms)
+            if self.tick_count >= 150 {
                 self.tick_count = 0;
                 self.poll_new_messages().await;
             }
@@ -208,6 +223,7 @@ impl App {
             Constraint::Percentage(75),
         ]).areas(area);
 
+        self.sidebar_area = sidebar_area;
         self.draw_sidebar(frame, sidebar_area);
         self.draw_main(frame, main_area);
     }
@@ -438,6 +454,8 @@ impl App {
 
         let inner_width = msg_area.width.saturating_sub(2) as usize; // borders
         let view_height = msg_area.height.saturating_sub(2) as usize;
+        self.view_height = view_height;
+        self.msg_area = msg_area;
 
         let wrapped_lines = if self.current_email_id.is_some() {
             self.render_email(inner_width)
@@ -849,14 +867,12 @@ impl App {
                 }
                 KeyCode::Char('e') => self.load_emails().await,
                 KeyCode::Char('/') => {
-                    self.search_active = true;
-                    self.focus = Focus::Search;
-                    self.search_query.clear();
-                    self.update_search_results();
-                    self.search_list_state.select(Some(0));
+                    if let Some((path, line)) = self.spawn_tv() {
+                        self.navigate_to_tv_selection(&path, line).await;
+                    }
                 }
                 KeyCode::Tab | KeyCode::Right => {
-                    if self.current_conv_id.is_some() {
+                    if self.current_conv_id.is_some() || self.current_email_id.is_some() {
                         self.focus = Focus::Messages;
                     }
                 }
@@ -892,16 +908,18 @@ impl App {
                     self.scroll_offset = self.scroll_offset.saturating_sub(1);
                 }
                 KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.scroll_offset = self.scroll_offset.saturating_add(20);
+                    let half = self.view_height / 2;
+                    self.scroll_offset = self.scroll_offset.saturating_add(half.max(1));
                 }
                 KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(20);
+                    let half = self.view_height / 2;
+                    self.scroll_offset = self.scroll_offset.saturating_sub(half.max(1));
                 }
                 KeyCode::PageDown => {
-                    self.scroll_offset = self.scroll_offset.saturating_add(20);
+                    self.scroll_offset = self.scroll_offset.saturating_add(self.view_height.max(1));
                 }
                 KeyCode::PageUp => {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(20);
+                    self.scroll_offset = self.scroll_offset.saturating_sub(self.view_height.max(1));
                 }
                 KeyCode::Char('G') => {
                     // Jump to bottom
@@ -912,11 +930,9 @@ impl App {
                 }
                 KeyCode::Char('r') => self.load_messages().await,
                 KeyCode::Char('/') => {
-                    self.search_active = true;
-                    self.focus = Focus::Search;
-                    self.search_query.clear();
-                    self.update_search_results();
-                    self.search_list_state.select(Some(0));
+                    if let Some((path, line)) = self.spawn_tv() {
+                        self.navigate_to_tv_selection(&path, line).await;
+                    }
                 }
                 _ => {}
             },
@@ -939,6 +955,55 @@ impl App {
                 self.handle_search_key(key).await;
             }
         }
+    }
+
+    async fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        let col = mouse.column;
+        let row = mouse.row;
+
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if self.in_area(col, row, self.msg_area) {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                } else if self.in_area(col, row, self.sidebar_area) {
+                    self.sidebar_prev();
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if self.in_area(col, row, self.msg_area) {
+                    self.scroll_offset = self.scroll_offset.saturating_add(3);
+                } else if self.in_area(col, row, self.sidebar_area) {
+                    self.sidebar_next();
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.search_active {
+                    return;
+                }
+                if self.in_area(col, row, self.sidebar_area) {
+                    self.focus = Focus::Sidebar;
+                    // Calculate which sidebar item was clicked
+                    // sidebar list has 1-line border top + 1-line status bottom
+                    let visible_row = (row - self.sidebar_area.y).saturating_sub(1) as usize;
+                    let list_offset = self.sidebar_state.offset();
+                    let item_idx = list_offset + visible_row;
+                    if item_idx < self.sidebar_items.len() {
+                        if matches!(self.sidebar_items[item_idx], SidebarItem::Conv(_) | SidebarItem::Email(_)) {
+                            self.sidebar_state.select(Some(item_idx));
+                            self.search_highlight.clear();
+                            self.preview_selected().await;
+                        }
+                    }
+                } else if self.in_area(col, row, self.msg_area) {
+                    self.focus = Focus::Messages;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn in_area(&self, col: u16, row: u16, area: Rect) -> bool {
+        col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
     }
 
     async fn handle_search_key(&mut self, key: KeyCode) {
@@ -995,9 +1060,9 @@ impl App {
         let total = self.sidebar_items.len();
         if total == 0 { return; }
         let current = self.sidebar_state.selected().unwrap_or(0);
-        // Find next Conv item (skip headers)
+        // Find next selectable item (skip headers)
         for i in (current + 1)..total {
-            if matches!(self.sidebar_items[i], SidebarItem::Conv(_)) {
+            if matches!(self.sidebar_items[i], SidebarItem::Conv(_) | SidebarItem::Email(_)) {
                 self.sidebar_state.select(Some(i));
                 return;
             }
@@ -1006,9 +1071,9 @@ impl App {
 
     fn sidebar_prev(&mut self) {
         let current = self.sidebar_state.selected().unwrap_or(0);
-        // Find prev Conv item (skip headers)
+        // Find prev selectable item (skip headers)
         for i in (0..current).rev() {
-            if matches!(self.sidebar_items[i], SidebarItem::Conv(_)) {
+            if matches!(self.sidebar_items[i], SidebarItem::Conv(_) | SidebarItem::Email(_)) {
                 self.sidebar_state.select(Some(i));
                 return;
             }
@@ -1074,7 +1139,7 @@ impl App {
 
         self.sidebar_items = items;
 
-        // Restore selection by conv ID, or select first item
+        // Restore selection by conv/email ID, or select first item
         let mut restored = false;
         if let Some(prev_id) = prev_selected_id {
             for (i, item) in self.sidebar_items.iter().enumerate() {
@@ -1083,6 +1148,22 @@ impl App {
                         self.sidebar_state.select(Some(i));
                         restored = true;
                         break;
+                    }
+                }
+            }
+        }
+        if !restored {
+            // Try to restore email selection
+            if let Some(email_id) = &self.current_email_id {
+                for (i, item) in self.sidebar_items.iter().enumerate() {
+                    if let SidebarItem::Email(idx) = item {
+                        if let Some(email) = self.emails.get(*idx) {
+                            if email.get("id").and_then(|v| v.as_str()) == Some(email_id) {
+                                self.sidebar_state.select(Some(i));
+                                restored = true;
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -1426,6 +1507,125 @@ impl App {
         }
     }
 
+    /// Suspend TUI, spawn tv for search, return selected file path and line number
+    fn spawn_tv(&self) -> Option<(String, Option<usize>)> {
+        use std::process::Command;
+
+        let data_dir = self.auth.config_dir().join("data");
+        let data_path = data_dir.to_string_lossy();
+
+        // Suspend TUI
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableMouseCapture,
+            crossterm::terminal::LeaveAlternateScreen,
+        );
+        let _ = crossterm::terminal::disable_raw_mode();
+
+        // Spawn tv with rg as source
+        let source_cmd = format!(
+            "rg . --no-heading --line-number --color=never {}",
+            data_path
+        );
+        let result = Command::new("tv")
+            .arg("--source-command")
+            .arg(&source_cmd)
+            .arg("--preview-command")
+            .arg("teamsh preview '{}'")
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .output();
+
+        // Resume TUI
+        let _ = crossterm::terminal::enable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::event::EnableMouseCapture,
+        );
+
+        match result {
+            Ok(output) => {
+                let selection = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if selection.is_empty() {
+                    return None;
+                }
+                // Parse: path/to/file.txt:line_number:matched_text
+                let parts: Vec<&str> = selection.splitn(3, ':').collect();
+                let file_path = parts[0].to_string();
+                let line_num = parts.get(1).and_then(|s| s.parse::<usize>().ok());
+                Some((file_path, line_num))
+            }
+            Err(_e) => {
+                // tv not found or failed
+                None
+            }
+        }
+    }
+
+    async fn navigate_to_tv_selection(&mut self, file_path: &str, _line_num: Option<usize>) {
+        let parts: Vec<&str> = file_path.split('/').collect();
+
+        // Look for "conversations" in path
+        if let Some(pos) = parts.iter().position(|&p| p == "conversations") {
+            if let Some(conv_id_safe) = parts.get(pos + 1) {
+                let conv_id_safe = *conv_id_safe;
+                // Find conversation by matching safe_filename version of ID
+                for (i, conv) in self.conversations.iter().enumerate() {
+                    let safe = conv.id.replace('/', "_").replace('\\', "_").replace(':', "_")
+                        .replace('?', "_").replace('*', "_").replace('"', "_")
+                        .replace('<', "_").replace('>', "_").replace('|', "_");
+                    if safe == conv_id_safe || conv.id == conv_id_safe {
+                        let id = conv.id.clone();
+                        let topic = conv.display_name(&self.my_name);
+                        self.current_email_id = None;
+                        self.current_email_body = None;
+                        self.current_conv_id = Some(id.clone());
+                        self.current_conv_topic = topic;
+                        self.has_new_messages.insert(id.clone(), false);
+                        self.read_locally.insert(id, true);
+                        self.load_messages().await;
+                        self.scroll_offset = usize::MAX;
+                        self.focus = Focus::Messages;
+
+                        // Select in sidebar
+                        for (si, item) in self.sidebar_items.iter().enumerate() {
+                            if let SidebarItem::Conv(idx) = item {
+                                if *idx == i {
+                                    self.sidebar_state.select(Some(si));
+                                    break;
+                                }
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Look for "emails" in path
+        if let Some(pos) = parts.iter().position(|&p| p == "emails") {
+            if parts.get(pos + 2).is_some() {
+                let email_file = parts[pos + 2];
+                let email_id_safe = email_file.trim_end_matches(".txt");
+                for (i, email) in self.emails.iter().enumerate() {
+                    let eid = email.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let safe = eid.replace('/', "_").replace('\\', "_").replace(':', "_")
+                        .replace('?', "_").replace('*', "_").replace('"', "_")
+                        .replace('<', "_").replace('>', "_").replace('|', "_");
+                    if safe == email_id_safe || eid == email_id_safe {
+                        self.preview_email(i).await;
+                        self.focus = Focus::Messages;
+                        return;
+                    }
+                }
+            }
+        }
+
+        self.status = "Could not find item from tv selection".to_string();
+    }
+
     async fn load_messages(&mut self) {
         if let Some(conv_id) = &self.current_conv_id.clone() {
             match self.api.get_messages(&mut self.auth, conv_id, 50).await {
@@ -1483,76 +1683,67 @@ impl App {
     // --- Search ---
 
     fn update_search_results(&mut self) {
-        let query = self.search_query.to_lowercase();
-        self.search_results = self
-            .conversations
-            .iter()
-            .enumerate()
-            .filter(|(_, conv)| {
-                if matches!(conv.kind(), ConvKind::System) {
-                    return false;
-                }
-                if query.is_empty() {
-                    return true;
-                }
+        use nucleo_matcher::{Matcher, Config, Utf32Str};
+        use nucleo_matcher::pattern::{Pattern, CaseMatching, Normalization, AtomKind};
 
-                let name = conv.display_name(&self.my_name).to_lowercase();
-                if name.contains(&query) {
-                    return true;
-                }
+        let query = &self.search_query;
 
+        if query.is_empty() {
+            // Show all non-system conversations and all emails
+            self.search_results = self.conversations.iter().enumerate()
+                .filter(|(_, conv)| !matches!(conv.kind(), ConvKind::System))
+                .map(|(i, _)| i)
+                .collect();
+            self.search_email_results = (0..self.emails.len()).collect();
+        } else {
+            let mut matcher = Matcher::new(Config::DEFAULT);
+            let pattern = Pattern::new(query, CaseMatching::Smart, Normalization::Smart, AtomKind::Fuzzy);
+            let mut buf = Vec::new();
+
+            // Fuzzy match conversations - score each individually
+            let mut conv_scored: Vec<(usize, u32)> = Vec::new();
+            for (i, conv) in self.conversations.iter().enumerate() {
+                if matches!(conv.kind(), ConvKind::System) { continue; }
+                let mut text = conv.display_name(&self.my_name);
+                let topic = conv.topic();
+                if topic != "(no topic)" {
+                    text = format!("{} {}", text, topic);
+                }
                 for member in &conv.member_names {
-                    if member.to_lowercase().contains(&query) {
-                        return true;
-                    }
+                    text = format!("{} {}", text, member);
                 }
-
-                let topic = conv.topic().to_lowercase();
-                if topic != "(no topic)" && topic.contains(&query) {
-                    return true;
-                }
-
-                if let Some(lm) = &conv.last_message {
-                    if let Some(sender) = lm
-                        .from_display_name
-                        .as_deref()
-                        .or(lm.imdisplayname.as_deref())
-                    {
-                        if sender.to_lowercase().contains(&query) {
-                            return true;
-                        }
-                    }
-                }
-
-                // Search cached message content
                 if let Some(snippets) = self.cached_snippets.get(&conv.id) {
-                    for snippet in snippets {
-                        if snippet.to_lowercase().contains(&query) {
-                            return true;
-                        }
+                    for s in snippets.iter().take(3) {
+                        text = format!("{} {}", text, s);
                     }
                 }
+                let haystack = Utf32Str::new(&text, &mut buf);
+                if let Some(score) = pattern.score(haystack, &mut matcher) {
+                    conv_scored.push((i, score));
+                }
+            }
+            conv_scored.sort_by(|a, b| b.1.cmp(&a.1));
+            self.search_results = conv_scored.into_iter().map(|(i, _)| i).collect();
 
-                false
-            })
-            .map(|(i, _)| i)
-            .collect();
-
-        // Also search emails
-        self.search_email_results = self.emails.iter().enumerate()
-            .filter(|(_, email)| {
-                if query.is_empty() { return true; }
-                let subject = email.get("subject").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            // Fuzzy match emails
+            let mut email_scored: Vec<(usize, u32)> = Vec::new();
+            for (i, email) in self.emails.iter().enumerate() {
+                let subject = email.get("subject").and_then(|v| v.as_str()).unwrap_or("");
                 let from = email.get("from")
                     .and_then(|v| v.get("emailAddress"))
                     .and_then(|v| v.get("name"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("").to_lowercase();
-                let preview = email.get("bodyPreview").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-                subject.contains(&query) || from.contains(&query) || preview.contains(&query)
-            })
-            .map(|(i, _)| i)
-            .collect();
+                    .unwrap_or("");
+                let preview = email.get("bodyPreview").and_then(|v| v.as_str()).unwrap_or("");
+                let text = format!("{} {} {}", subject, from, preview);
+                let haystack = Utf32Str::new(&text, &mut buf);
+                if let Some(score) = pattern.score(haystack, &mut matcher) {
+                    email_scored.push((i, score));
+                }
+            }
+            email_scored.sort_by(|a, b| b.1.cmp(&a.1));
+            self.search_email_results = email_scored.into_iter().map(|(i, _)| i).collect();
+        }
 
         let total = self.search_results.len() + self.search_email_results.len();
         if total > 0 {
@@ -1640,6 +1831,7 @@ impl App {
         match self.api.list_conversations(&mut self.auth, 100).await {
             Ok(resp) => {
                 let mut found_new = false;
+                let mut current_conv_has_new = false;
                 for conv in &resp.conversations {
                     if let Some(lm) = &conv.last_message {
                         if let Some(id) = &lm.id {
@@ -1647,12 +1839,43 @@ impl App {
                                 if id != old_id {
                                     self.has_new_messages.insert(conv.id.clone(), true);
                                     found_new = true;
+                                    if self.current_conv_id.as_deref() == Some(&conv.id) {
+                                        current_conv_has_new = true;
+                                    }
                                 }
                             }
                             self.last_message_ids.insert(conv.id.clone(), id.clone());
                         }
                     }
                 }
+
+                // Update conversation list with fresh data
+                let mut convs = resp.conversations;
+                convs.sort_by(|a, b| b.version.unwrap_or(0).cmp(&a.version.unwrap_or(0)));
+                // Preserve member names from old conversations
+                let old_names: HashMap<String, Vec<String>> = self.conversations.iter()
+                    .filter(|c| !c.member_names.is_empty())
+                    .map(|c| (c.id.clone(), c.member_names.clone()))
+                    .collect();
+                for conv in convs.iter_mut() {
+                    if conv.member_names.is_empty() {
+                        if let Some(names) = old_names.get(&conv.id) {
+                            conv.member_names = names.clone();
+                        }
+                    }
+                }
+                self.conversations = convs;
+                self.rebuild_sidebar();
+
+                // Auto-reload messages for the currently open conversation
+                if current_conv_has_new {
+                    let was_at_bottom = self.scroll_offset >= self.rendered_line_count.saturating_sub(self.view_height);
+                    self.load_messages().await;
+                    if was_at_bottom {
+                        self.scroll_offset = usize::MAX; // stay at bottom
+                    }
+                }
+
                 if found_new {
                     print!("\x07");
                 }
