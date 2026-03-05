@@ -509,7 +509,7 @@ impl App {
         let help = match self.focus {
             Focus::Input => " Enter:send  Esc:cancel ",
             Focus::Messages => " j/k:scroll  PgUp/Dn  G:end  g:top  Tab:sidebar  i:compose  /:search  r:refresh ",
-            _ => " Tab:messages  i:compose  Esc:back ",
+            _ => " Tab:messages  i:compose  /:search  r:refresh  e:emails  q:quit ",
         };
         let help_widget = Paragraph::new(
             Line::from(help).style(Style::default().fg(Color::DarkGray)),
@@ -843,7 +843,11 @@ impl App {
                     self.search_highlight.clear();
                     self.preview_selected().await;
                 }
-                KeyCode::Char('r') => self.load_conversations().await,
+                KeyCode::Char('r') => {
+                    self.load_conversations().await;
+                    self.load_emails().await;
+                }
+                KeyCode::Char('e') => self.load_emails().await,
                 KeyCode::Char('/') => {
                     self.search_active = true;
                     self.focus = Focus::Search;
@@ -1278,21 +1282,22 @@ impl App {
     }
 
     async fn load_emails(&mut self) {
+        self.status = "Loading emails...".to_string();
         match self.api.list_emails(&mut self.auth, "inbox", 25).await {
             Ok(emails) => {
+                let count = emails.len();
                 self.emails = emails;
                 self.email_loaded = true;
                 self.rebuild_sidebar();
-                if !self.emails.is_empty() {
-                    self.status = format!(
-                        "{} conversations, {} emails",
-                        self.conversations.len(),
-                        self.emails.len()
-                    );
-                }
+                self.status = format!(
+                    "{} conversations, {} emails",
+                    self.conversations.len(),
+                    count,
+                );
             }
             Err(e) => {
-                self.status = format!("Email load: {}", e);
+                // Keep error visible - don't overwrite
+                self.status = format!("Emails failed: {} (press 'e' to retry)", e);
                 self.email_loaded = true;
             }
         }
