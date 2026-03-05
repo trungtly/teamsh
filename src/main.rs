@@ -318,7 +318,7 @@ async fn cmd_sync() -> Result<()> {
                     let ts = m.timestamp.as_deref().unwrap_or("");
                     let sender = m.imdisplayname.as_deref().unwrap_or("?");
                     let content = m.content.as_deref().unwrap_or("");
-                    store.save_message(&conv.id, mid, ts, sender, content)?;
+                    store.save_message(&conv.id, mid, ts, sender, "", content)?;
                     msg_count += 1;
                 }
             }

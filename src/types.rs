@@ -63,7 +63,7 @@ pub struct Message {
     pub properties: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ConvKind {
     Channel,
     Chat,
