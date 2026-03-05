@@ -34,11 +34,12 @@ enum Focus {
     Search,
 }
 
-/// Sidebar item: either a section header or a conversation entry
+/// Sidebar item: either a section header or a conversation/email entry
 #[derive(Debug, Clone)]
 enum SidebarItem {
     Header(String),
-    Conv(usize), // index into self.conversations
+    Conv(usize),  // index into self.conversations
+    Email(usize), // index into self.emails
 }
 
 pub struct App {
@@ -73,9 +74,11 @@ pub struct App {
     // Search
     search_active: bool,
     search_query: String,
-    search_results: Vec<usize>,
+    search_results: Vec<usize>,       // conversation indices
+    search_email_results: Vec<usize>, // email indices
     search_list_state: ListState,
     search_people_results: Vec<(String, String)>,
+    search_highlight: String, // active search term to highlight in message view
 
     // Message content cache for search
     cached_snippets: HashMap<String, Vec<String>>,
@@ -84,6 +87,16 @@ pub struct App {
     tick_count: u32,
     last_message_ids: HashMap<String, String>,
     has_new_messages: HashMap<String, bool>,
+
+    // Track conversations read locally (to suppress stale unread from API)
+    read_locally: HashMap<String, bool>,
+
+    // Emails (Microsoft Graph)
+    emails: Vec<serde_json::Value>,
+    current_email_id: Option<String>,
+    current_email_body: Option<String>, // HTML body of selected email
+    current_email_subject: String,
+    email_loaded: bool,
 }
 
 impl App {
@@ -113,20 +126,39 @@ impl App {
             search_query: String::new(),
             search_results: Vec::new(),
             search_list_state: ListState::default(),
+            search_email_results: Vec::new(),
             search_people_results: Vec::new(),
+            search_highlight: String::new(),
             cached_snippets: HashMap::new(),
             tick_count: 0,
             last_message_ids: HashMap::new(),
             has_new_messages: HashMap::new(),
+            read_locally: HashMap::new(),
+            emails: Vec::new(),
+            current_email_id: None,
+            current_email_body: None,
+            current_email_subject: String::new(),
+            email_loaded: false,
         };
 
         // Try loading from cache first for instant startup
         app.load_from_cache();
         if app.conversations.is_empty() {
             app.load_conversations().await;
+            // Mark all as read on first load (user has already seen everything)
+            for conv in &app.conversations {
+                app.read_locally.insert(conv.id.clone(), true);
+            }
         } else {
+            // From cache - mark all as read (stale unread state)
+            for conv in &app.conversations {
+                app.read_locally.insert(conv.id.clone(), true);
+            }
             app.status = format!("{} conversations (cached)", app.conversations.len());
         }
+
+        // Load emails in background (don't block startup)
+        app.load_emails().await;
         Ok(app)
     }
 
@@ -209,8 +241,13 @@ impl App {
                     };
                     let name = conv.display_name(&self.my_name);
                     let is_current = self.current_conv_id.as_deref() == Some(&conv.id);
-                    let unread = conv.is_unread()
-                        || self.has_new_messages.get(&conv.id).copied().unwrap_or(false);
+                    let read_local = self.read_locally.get(&conv.id).copied().unwrap_or(false);
+                    let unread = if read_local {
+                        self.has_new_messages.get(&conv.id).copied().unwrap_or(false)
+                    } else {
+                        conv.is_unread()
+                            || self.has_new_messages.get(&conv.id).copied().unwrap_or(false)
+                    };
 
                     let line = if is_current {
                         Line::from(vec![
@@ -245,6 +282,68 @@ impl App {
                     };
                     items.push(ListItem::new(line));
                 }
+                SidebarItem::Email(email_idx) => {
+                    if let Some(email) = self.emails.get(*email_idx) {
+                        let subject = email.get("subject")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("(no subject)");
+                        let from = email.get("from")
+                            .and_then(|v| v.get("emailAddress"))
+                            .and_then(|v| v.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?");
+                        let is_read = email.get("isRead")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        let email_id = email.get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let is_current = self.current_email_id.as_deref() == Some(email_id);
+
+                        // Truncate subject for sidebar
+                        let label = if subject.len() > 30 {
+                            format!("{}..", &subject[..28])
+                        } else {
+                            subject.to_string()
+                        };
+
+                        let line = if is_current {
+                            Line::from(vec![
+                                Span::styled("  ", Style::default()),
+                                Span::styled(
+                                    format!("{} ", from),
+                                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    label,
+                                    Style::default().fg(Color::Cyan),
+                                ),
+                            ])
+                        } else if !is_read {
+                            Line::from(vec![
+                                Span::styled("  ", Style::default()),
+                                Span::styled(
+                                    format!("{} ", from),
+                                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    label,
+                                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                                ),
+                            ])
+                        } else {
+                            Line::from(vec![
+                                Span::styled("  ", Style::default().fg(Color::DarkGray)),
+                                Span::styled(
+                                    format!("{} ", from),
+                                    Style::default().fg(Color::DarkGray),
+                                ),
+                                Span::raw(label),
+                            ])
+                        };
+                        items.push(ListItem::new(line));
+                    }
+                }
             }
         }
 
@@ -270,25 +369,25 @@ impl App {
         frame.render_stateful_widget(list, list_area, &mut self.sidebar_state);
 
         let status_text = if self.focus == Focus::Sidebar {
-            &self.status
+            self.status.clone()
         } else {
-            ""
+            String::new()
         };
         let status = Paragraph::new(
-            Line::from(status_text).style(Style::default().fg(Color::DarkGray)),
+            Line::from(Span::styled(status_text, Style::default().fg(Color::DarkGray))),
         );
         frame.render_widget(status, status_area);
     }
 
     fn draw_main(&mut self, frame: &mut Frame, area: Rect) {
-        if self.current_conv_id.is_none() {
-            // No conversation open - show welcome
+        if self.current_conv_id.is_none() && self.current_email_id.is_none() {
+            // No conversation or email open - show welcome
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray));
             let welcome = Paragraph::new(vec![
                 Line::from(""),
-                Line::from("  Select a conversation from the sidebar"),
+                Line::from("  Select a conversation or email from the sidebar"),
                 Line::from(""),
                 Line::from(
                     Span::styled("  j/k to navigate, Enter to open", Style::default().fg(Color::DarkGray))
@@ -299,16 +398,17 @@ impl App {
             return;
         }
 
+        let is_email = self.current_email_id.is_some();
         let [header_area, msg_area, input_area, help_area] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(3),
+            Constraint::Length(if is_email { 0 } else { 3 }),
             Constraint::Length(1),
         ])
         .areas(area);
 
         // Header
-        let header = Paragraph::new(Line::from(vec![
+        let mut header_spans = vec![
             Span::styled(" ", Style::default()),
             Span::styled(
                 &self.current_conv_topic,
@@ -316,7 +416,14 @@ impl App {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-        ]));
+        ];
+        if !self.search_highlight.is_empty() {
+            header_spans.push(Span::styled(
+                format!("  [search: {}]", self.search_highlight),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        let header = Paragraph::new(Line::from(header_spans));
         frame.render_widget(header, header_area);
 
         // Messages - manual wrapping for correct scroll
@@ -332,7 +439,11 @@ impl App {
         let inner_width = msg_area.width.saturating_sub(2) as usize; // borders
         let view_height = msg_area.height.saturating_sub(2) as usize;
 
-        let wrapped_lines = self.render_messages(inner_width);
+        let wrapped_lines = if self.current_email_id.is_some() {
+            self.render_email(inner_width)
+        } else {
+            self.render_messages(inner_width)
+        };
         self.rendered_line_count = wrapped_lines.len();
 
         // Cap scroll
@@ -397,7 +508,7 @@ impl App {
         // Help
         let help = match self.focus {
             Focus::Input => " Enter:send  Esc:cancel ",
-            Focus::Messages => " j/k:scroll  PgUp/Dn  G:end  g:top  Tab:sidebar  i:compose  r:refresh ",
+            Focus::Messages => " j/k:scroll  PgUp/Dn  G:end  g:top  Tab:sidebar  i:compose  /:search  r:refresh ",
             _ => " Tab:messages  i:compose  Esc:back ",
         };
         let help_widget = Paragraph::new(
@@ -462,14 +573,18 @@ impl App {
 
             // Rich content lines with formatting
             let rich_lines = html::strip_html_rich(content);
+            let highlight = &self.search_highlight;
             for rich_line in &rich_lines {
                 let mut spans = vec![Span::raw("  ".to_string())];
                 spans.extend(html::rich_to_spans(rich_line));
-                // Wrap: for now, create the line and let long lines get clipped
-                // TODO: proper span-aware wrapping
+
+                // Apply search highlighting if active
+                if !highlight.is_empty() {
+                    spans = apply_search_highlight(spans, highlight);
+                }
+
                 let line_text: String = spans.iter().map(|s| s.content.as_ref()).collect();
                 if line_text.len() > width && width > 4 {
-                    // Simple wrapping: render as plain wrapped with style of first content span
                     let style = if rich_line.iter().any(|s| s.quote) {
                         Style::default().fg(Color::DarkGray)
                     } else if rich_line.iter().any(|s| s.bold) {
@@ -525,6 +640,72 @@ impl App {
         lines
     }
 
+    /// Render an email body into wrapped lines for the main panel.
+    fn render_email(&self, width: usize) -> Vec<Line<'static>> {
+        if width == 0 {
+            return Vec::new();
+        }
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+
+        // Email header info
+        if let Some(email_idx) = self.emails.iter().position(|e| {
+            e.get("id").and_then(|v| v.as_str()) == self.current_email_id.as_deref()
+        }) {
+            let email = &self.emails[email_idx];
+            let from = email.get("from")
+                .and_then(|v| v.get("emailAddress"))
+                .map(|ea| {
+                    let name = ea.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let addr = ea.get("address").and_then(|v| v.as_str()).unwrap_or("");
+                    format!("{} <{}>", name, addr)
+                })
+                .unwrap_or_else(|| "?".to_string());
+            let date = email.get("receivedDateTime")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .get(..16)
+                .unwrap_or("?");
+
+            lines.push(Line::from(vec![
+                Span::styled("From: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(from, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Date: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(date.to_string(), Style::default().fg(Color::DarkGray)),
+            ]));
+            lines.push(Line::from(""));
+        }
+
+        // Email body
+        let body_html = self.current_email_body.as_deref().unwrap_or("Loading...");
+        let rich_lines = html::strip_html_rich(body_html);
+        for rich_line in &rich_lines {
+            let mut spans = html::rich_to_spans(rich_line);
+
+            if !self.search_highlight.is_empty() {
+                spans = apply_search_highlight(spans, &self.search_highlight);
+            }
+
+            let line_text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+            if line_text.len() > width && width > 4 {
+                let style = if rich_line.iter().any(|s| s.bold) {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                for wrapped in wrap_text(&line_text, width) {
+                    lines.push(Line::from(Span::styled(wrapped, style)));
+                }
+            } else {
+                lines.push(Line::from(spans));
+            }
+        }
+
+        lines
+    }
+
     fn draw_search(&mut self, frame: &mut Frame) {
         let area = frame.area();
         let [input_area, results_area, status_area] = Layout::vertical([
@@ -561,8 +742,13 @@ impl App {
                     ConvKind::System => continue,
                 };
                 let name = conv.display_name(&self.my_name);
-                let unread = conv.is_unread()
-                    || self.has_new_messages.get(&conv.id).copied().unwrap_or(false);
+                let read_local = self.read_locally.get(&conv.id).copied().unwrap_or(false);
+                let unread = if read_local {
+                    self.has_new_messages.get(&conv.id).copied().unwrap_or(false)
+                } else {
+                    conv.is_unread()
+                        || self.has_new_messages.get(&conv.id).copied().unwrap_or(false)
+                };
                 let style = if unread {
                     Style::default()
                         .fg(Color::White)
@@ -573,6 +759,27 @@ impl App {
                 items.push(ListItem::new(
                     Line::from(format!(" {}{}", prefix, name)).style(style),
                 ));
+            }
+        }
+
+        // Email search results
+        if !self.search_email_results.is_empty() {
+            items.push(ListItem::new(
+                Line::from(" Emails")
+                    .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            ));
+            for &idx in &self.search_email_results {
+                if let Some(email) = self.emails.get(idx) {
+                    let subject = email.get("subject").and_then(|v| v.as_str()).unwrap_or("(no subject)");
+                    let from = email.get("from")
+                        .and_then(|v| v.get("emailAddress"))
+                        .and_then(|v| v.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    items.push(ListItem::new(
+                        Line::from(format!("   {} - {}", from, subject)),
+                    ));
+                }
             }
         }
 
@@ -628,10 +835,12 @@ impl App {
                 KeyCode::Char('q') => self.exit = true,
                 KeyCode::Char('j') | KeyCode::Down => {
                     self.sidebar_next();
+                    self.search_highlight.clear();
                     self.preview_selected().await;
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
                     self.sidebar_prev();
+                    self.search_highlight.clear();
                     self.preview_selected().await;
                 }
                 KeyCode::Char('r') => self.load_conversations().await,
@@ -660,7 +869,11 @@ impl App {
             },
             Focus::Messages => match key {
                 KeyCode::Esc | KeyCode::Left => {
-                    self.focus = Focus::Sidebar;
+                    if !self.search_highlight.is_empty() {
+                        self.search_highlight.clear();
+                    } else {
+                        self.focus = Focus::Sidebar;
+                    }
                 }
                 KeyCode::Tab => {
                     self.focus = Focus::Sidebar;
@@ -727,11 +940,8 @@ impl App {
     async fn handle_search_key(&mut self, key: KeyCode) {
         match key {
             KeyCode::Esc => {
-                self.search_active = false;
+                self.close_search();
                 self.focus = Focus::Sidebar;
-                self.search_query.clear();
-                self.search_results.clear();
-                self.search_people_results.clear();
             }
             KeyCode::Enter => {
                 self.open_search_result().await;
@@ -805,7 +1015,7 @@ impl App {
         let selected = self.sidebar_state.selected()?;
         match self.sidebar_items.get(selected)? {
             SidebarItem::Conv(idx) => Some(*idx),
-            SidebarItem::Header(_) => None,
+            _ => None,
         }
     }
 
@@ -851,6 +1061,13 @@ impl App {
             }
         }
 
+        if !self.emails.is_empty() {
+            items.push(SidebarItem::Header(format!("Emails ({})", self.emails.len())));
+            for idx in 0..self.emails.len() {
+                items.push(SidebarItem::Email(idx));
+            }
+        }
+
         self.sidebar_items = items;
 
         // Restore selection by conv ID, or select first item
@@ -878,34 +1095,63 @@ impl App {
 
     // --- Actions ---
 
-    /// Auto-preview: load messages for the currently selected sidebar item
+    /// Auto-preview: load messages/email for the currently selected sidebar item
     async fn preview_selected(&mut self) {
-        let conv_info = self.selected_conversation_idx().map(|idx| {
-            let conv = &self.conversations[idx];
-            (conv.id.clone(), conv.display_name(&self.my_name))
-        });
-        if let Some((id, topic)) = conv_info {
-            if self.current_conv_id.as_deref() != Some(&id) {
+        let selected = self.sidebar_state.selected();
+        if selected.is_none() { return; }
+        let selected = selected.unwrap();
+
+        match self.sidebar_items.get(selected) {
+            Some(SidebarItem::Conv(idx)) => {
+                let idx = *idx;
+                let conv = &self.conversations[idx];
+                let id = conv.id.clone();
+                let topic = conv.display_name(&self.my_name);
+                if self.current_conv_id.as_deref() != Some(&id) {
+                    self.has_new_messages.insert(id.clone(), false);
+                    self.read_locally.insert(id.clone(), true);
+                    self.current_email_id = None;
+                    self.current_email_body = None;
+                    self.current_conv_id = Some(id);
+                    self.current_conv_topic = topic;
+                    self.messages.clear();
+                    self.load_messages().await;
+                    self.scroll_offset = usize::MAX;
+                }
+            }
+            Some(SidebarItem::Email(idx)) => {
+                let idx = *idx;
+                self.preview_email(idx).await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn open_conversation(&mut self) {
+        let selected = self.sidebar_state.selected();
+        if selected.is_none() { return; }
+        let selected = selected.unwrap();
+
+        match self.sidebar_items.get(selected) {
+            Some(SidebarItem::Conv(idx)) => {
+                let idx = *idx;
+                let conv = &self.conversations[idx];
+                let id = conv.id.clone();
+                let topic = conv.display_name(&self.my_name);
+                self.has_new_messages.insert(id.clone(), false);
+                self.read_locally.insert(id.clone(), true);
+                self.current_email_id = None;
+                self.current_email_body = None;
                 self.current_conv_id = Some(id);
                 self.current_conv_topic = topic;
                 self.load_messages().await;
                 self.scroll_offset = usize::MAX;
             }
-        }
-    }
-
-    async fn open_conversation(&mut self) {
-        let conv_info = self.selected_conversation_idx().and_then(|idx| {
-            let conv = &self.conversations[idx];
-            Some((conv.id.clone(), conv.display_name(&self.my_name)))
-        });
-        if let Some((id, topic)) = conv_info {
-            self.has_new_messages.insert(id.clone(), false);
-            self.current_conv_id = Some(id);
-            self.current_conv_topic = topic;
-            self.load_messages().await;
-            // Scroll to bottom (latest messages visible)
-            self.scroll_offset = usize::MAX; // will be capped in draw
+            Some(SidebarItem::Email(idx)) => {
+                let idx = *idx;
+                self.preview_email(idx).await;
+            }
+            _ => {}
         }
     }
 
@@ -996,6 +1242,62 @@ impl App {
         let _ = cache.save(self.auth.config_dir());
     }
 
+    async fn preview_email(&mut self, idx: usize) {
+        let email = match self.emails.get(idx) {
+            Some(e) => e,
+            None => return,
+        };
+        let email_id = email.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if self.current_email_id.as_deref() == Some(&email_id) {
+            return;
+        }
+        let subject = email.get("subject").and_then(|v| v.as_str()).unwrap_or("(no subject)").to_string();
+        self.current_conv_id = None;
+        self.messages.clear();
+        self.current_email_id = Some(email_id.clone());
+        self.current_email_subject = subject.clone();
+        self.current_conv_topic = subject;
+        self.current_email_body = None;
+        self.scroll_offset = 0;
+
+        // Fetch full email body
+        match self.api.get_email(&mut self.auth, &email_id).await {
+            Ok(data) => {
+                let body_html = data.get("body")
+                    .and_then(|b| b.get("content"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                self.current_email_body = Some(body_html);
+            }
+            Err(e) => {
+                self.status = format!("Email error: {}", e);
+                self.current_email_body = Some(format!("Error loading email: {}", e));
+            }
+        }
+    }
+
+    async fn load_emails(&mut self) {
+        match self.api.list_emails(&mut self.auth, "inbox", 25).await {
+            Ok(emails) => {
+                self.emails = emails;
+                self.email_loaded = true;
+                self.rebuild_sidebar();
+                if !self.emails.is_empty() {
+                    self.status = format!(
+                        "{} conversations, {} emails",
+                        self.conversations.len(),
+                        self.emails.len()
+                    );
+                }
+            }
+            Err(e) => {
+                self.status = format!("Email load: {}", e);
+                self.email_loaded = true;
+            }
+        }
+    }
+
     async fn load_conversations(&mut self) {
         self.status = "Loading conversations...".to_string();
         // Clear polling state on full refresh
@@ -1007,7 +1309,13 @@ impl App {
                 // Sort by version (most recent activity first)
                 convs.sort_by(|a, b| b.version.unwrap_or(0).cmp(&a.version.unwrap_or(0)));
 
-                // Load cached snippets/names so we only fetch messages for new/changed convs
+                // Build lookup from old conversations for member names
+                let old_member_names: HashMap<String, Vec<String>> = self
+                    .conversations
+                    .iter()
+                    .filter(|c| !c.member_names.is_empty())
+                    .map(|c| (c.id.clone(), c.member_names.clone()))
+                    .collect();
                 let old_snippets = std::mem::take(&mut self.cached_snippets);
 
                 let mut name_counts: HashMap<String, usize> = HashMap::new();
@@ -1035,20 +1343,20 @@ impl App {
                         && !old_msg_id.is_empty()
                         && last_msg_id == old_msg_id;
 
-                    if has_cached && (unchanged || !needs_names) {
+                    // Restore member names from previous data
+                    if needs_names {
+                        if let Some(names) = old_member_names.get(&conv.id) {
+                            conv.member_names = names.clone();
+                        }
+                    }
+
+                    if has_cached && unchanged {
                         // Reuse cached snippets - no need to re-fetch
                         if let Some(snippets) = old_snippets.get(&conv.id) {
                             self.cached_snippets
                                 .insert(conv.id.clone(), snippets.clone());
                         }
-                        // For DMs, we still need member_names from cache
-                        // They'll be empty here since we reconstructed from API,
-                        // but if we had them cached we need to re-resolve
-                        if needs_names && !has_cached {
-                            // Fall through to fetch
-                        } else {
-                            continue;
-                        }
+                        continue;
                     }
 
                     let fetch_count = if needs_names { 10 } else { 5 };
@@ -1225,7 +1533,24 @@ impl App {
             .map(|(i, _)| i)
             .collect();
 
-        if !self.search_results.is_empty() {
+        // Also search emails
+        self.search_email_results = self.emails.iter().enumerate()
+            .filter(|(_, email)| {
+                if query.is_empty() { return true; }
+                let subject = email.get("subject").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                let from = email.get("from")
+                    .and_then(|v| v.get("emailAddress"))
+                    .and_then(|v| v.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("").to_lowercase();
+                let preview = email.get("bodyPreview").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                subject.contains(&query) || from.contains(&query) || preview.contains(&query)
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        let total = self.search_results.len() + self.search_email_results.len();
+        if total > 0 {
             self.search_list_state.select(Some(0));
         } else {
             self.search_list_state.select(None);
@@ -1234,6 +1559,9 @@ impl App {
 
     fn search_total_items(&self) -> usize {
         let mut count = self.search_results.len();
+        if !self.search_email_results.is_empty() {
+            count += 1 + self.search_email_results.len(); // +1 for header
+        }
         if !self.search_people_results.is_empty() {
             count += 2 + self.search_people_results.len();
         }
@@ -1252,24 +1580,53 @@ impl App {
 
     async fn open_search_result(&mut self) {
         let selected_idx = self.search_list_state.selected();
-        if let Some(sel) = selected_idx {
+        if selected_idx.is_none() { return; }
+        let sel = selected_idx.unwrap();
+
+        // Determine what was selected: conversation, email header, email, or people
+        let conv_count = self.search_results.len();
+        let _email_header_offset = conv_count;
+        let email_start = if self.search_email_results.is_empty() { conv_count } else { conv_count + 1 };
+        let email_end = email_start + self.search_email_results.len();
+
+        if sel < conv_count {
+            // Conversation result
             if let Some(&conv_idx) = self.search_results.get(sel) {
                 if let Some(conv) = self.conversations.get(conv_idx) {
                     let id = conv.id.clone();
                     let topic = conv.display_name(&self.my_name);
                     self.has_new_messages.insert(id.clone(), false);
+                    self.read_locally.insert(id.clone(), true);
+                    self.current_email_id = None;
+                    self.current_email_body = None;
                     self.current_conv_id = Some(id);
                     self.current_conv_topic = topic;
-                    self.search_active = false;
+                    self.search_highlight = self.search_query.clone();
+                    self.close_search();
                     self.focus = Focus::Messages;
-                    self.search_query.clear();
-                    self.search_results.clear();
-                    self.search_people_results.clear();
                     self.load_messages().await;
                     self.scroll_offset = usize::MAX;
                 }
             }
+        } else if sel >= email_start && sel < email_end {
+            // Email result
+            let email_idx_pos = sel - email_start;
+            if let Some(&email_idx) = self.search_email_results.get(email_idx_pos) {
+                self.search_highlight = self.search_query.clone();
+                self.close_search();
+                self.focus = Focus::Messages;
+                self.preview_email(email_idx).await;
+            }
         }
+        // Headers and people results are not openable
+    }
+
+    fn close_search(&mut self) {
+        self.search_active = false;
+        self.search_query.clear();
+        self.search_results.clear();
+        self.search_email_results.clear();
+        self.search_people_results.clear();
     }
 
     // --- Polling ---
@@ -1298,6 +1655,54 @@ impl App {
             Err(_) => {}
         }
     }
+}
+
+/// Split spans to highlight search matches with a bright background.
+fn apply_search_highlight(spans: Vec<Span<'static>>, query: &str) -> Vec<Span<'static>> {
+    let query_lower = query.to_lowercase();
+    let query_lower_len = query_lower.len();
+    let mut result = Vec::new();
+    for span in spans {
+        let text = span.content.to_string();
+        let text_lower = text.to_lowercase();
+        if !text_lower.contains(&query_lower) {
+            result.push(span);
+            continue;
+        }
+        // Map byte positions in lowercase back to original text
+        // For ASCII this is 1:1, for Unicode we iterate both in sync
+        let base_style = span.style;
+        let hl_style = base_style.bg(Color::Yellow).fg(Color::Black);
+        let mut pos = 0; // byte position in text_lower
+        loop {
+            if let Some(idx) = text_lower[pos..].find(&query_lower) {
+                let match_start = pos + idx;
+                let match_end = match_start + query_lower_len;
+                // Find corresponding byte positions in original text
+                let orig_start = byte_pos_in_original(&text, match_start);
+                let orig_end = byte_pos_in_original(&text, match_end);
+                let before_start = byte_pos_in_original(&text, pos);
+                if orig_start > before_start {
+                    result.push(Span::styled(text[before_start..orig_start].to_string(), base_style));
+                }
+                result.push(Span::styled(text[orig_start..orig_end].to_string(), hl_style));
+                pos = match_end;
+            } else {
+                let orig_pos = byte_pos_in_original(&text, pos);
+                if orig_pos < text.len() {
+                    result.push(Span::styled(text[orig_pos..].to_string(), base_style));
+                }
+                break;
+            }
+        }
+    }
+    result
+}
+
+/// Map a byte position in the lowercased string to the corresponding byte position
+/// in the original string. For ASCII text (which covers most Teams messages) these are identical.
+fn byte_pos_in_original(original: &str, lower_pos: usize) -> usize {
+    lower_pos.min(original.len())
 }
 
 /// Wrap a text string to fit within `width` columns, respecting Unicode width.

@@ -212,6 +212,7 @@ fn strip_tags_rich(html: &str) -> Vec<RichSegment> {
     let mut bold_depth = 0u32;
     let mut italic_depth = 0u32;
     let mut in_mention = false;
+    let mut mention_span_depth = 0u32; // track nested spans within mention
     let mut last_mention_id = String::new();
     let mut pending_mention_at = false;
     let mut link_url: Option<String> = None;
@@ -274,15 +275,45 @@ fn strip_tags_rich(html: &str) -> Vec<RichSegment> {
                 else if !is_close && tag_buf.contains("schema.skype.com/Mention") {
                     let mid = extract_attr(&tag_buf, "itemid");
                     if mid != last_mention_id {
-                        flush(&mut segments, &mut current_text,
-                              bold_depth > 0, italic_depth > 0, in_mention, &link_url);
+                        // New mention (different person)
+                        if in_mention {
+                            flush(&mut segments, &mut current_text,
+                                  bold_depth > 0, italic_depth > 0, true, &link_url);
+                        } else {
+                            flush(&mut segments, &mut current_text,
+                                  bold_depth > 0, italic_depth > 0, false, &link_url);
+                        }
                         in_mention = true;
                         pending_mention_at = true;
                         last_mention_id = mid;
                     }
-                } else if is_close && tag_buf.contains("/span") && in_mention {
-                    // Don't close mention on every /span - only when next tag is different
-                    // We'll handle this by checking the next mention id
+                    mention_span_depth += 1;
+                }
+                // Track span open/close for mention boundary detection
+                else if !is_close && tag_lower.starts_with("span") && in_mention {
+                    mention_span_depth += 1;
+                }
+                else if is_close && tag_lower == "/span" && in_mention {
+                    mention_span_depth = mention_span_depth.saturating_sub(1);
+                    if mention_span_depth == 0 {
+                        // All mention spans closed - flush mention segment
+                        flush(&mut segments, &mut current_text,
+                              bold_depth > 0, italic_depth > 0, true, &link_url);
+                        in_mention = false;
+                        // Don't clear last_mention_id yet - next span might be same person
+                    }
+                }
+                // Any non-span, non-formatting opening tag closes mention
+                else if !is_close && in_mention
+                    && !tag_lower.starts_with("span")
+                    && tag_lower != "b" && tag_lower != "strong"
+                    && tag_lower != "i" && tag_lower != "em"
+                {
+                    flush(&mut segments, &mut current_text,
+                          bold_depth > 0, italic_depth > 0, true, &link_url);
+                    in_mention = false;
+                    mention_span_depth = 0;
+                    last_mention_id.clear();
                 }
                 // Line breaks
                 else if !is_close && (tag_lower == "br" || tag_lower == "br/" || tag_lower == "br /") {

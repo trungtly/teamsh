@@ -205,6 +205,79 @@ impl Api {
         Ok(())
     }
 
+    // --- Email (Microsoft Graph API) ---
+
+    /// List emails from inbox (or a folder)
+    pub async fn list_emails(&self, auth: &mut Auth, folder: &str, top: u32) -> Result<Vec<serde_json::Value>> {
+        let token = auth.graph_token().await?;
+        let url = format!(
+            "https://graph.microsoft.com/v1.0/me/mailFolders/{}/messages?$top={}&$select=id,subject,from,receivedDateTime,isRead,hasAttachments,bodyPreview,importance&$orderby=receivedDateTime desc",
+            urlencoding::encode(folder), top
+        );
+        let resp = self.client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            anyhow::bail!("List emails failed ({}): {}", status, &text[..text.len().min(300)]);
+        }
+        let data: serde_json::Value = serde_json::from_str(&text)?;
+        let emails = data.get("value")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(emails)
+    }
+
+    /// Get a single email's full body
+    pub async fn get_email(&self, auth: &mut Auth, message_id: &str) -> Result<serde_json::Value> {
+        let token = auth.graph_token().await?;
+        let url = format!(
+            "https://graph.microsoft.com/v1.0/me/messages/{}?$select=id,subject,from,toRecipients,ccRecipients,body,receivedDateTime,isRead,hasAttachments,importance",
+            urlencoding::encode(message_id)
+        );
+        let resp = self.client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            anyhow::bail!("Get email failed ({}): {}", status, &text[..text.len().min(300)]);
+        }
+        let data: serde_json::Value = serde_json::from_str(&text)?;
+        Ok(data)
+    }
+
+    /// Search emails
+    pub async fn search_emails(&self, auth: &mut Auth, query: &str, top: u32) -> Result<Vec<serde_json::Value>> {
+        let token = auth.graph_token().await?;
+        let url = format!(
+            "https://graph.microsoft.com/v1.0/me/messages?$search=\"{}\"&$top={}&$select=id,subject,from,receivedDateTime,isRead,hasAttachments,bodyPreview",
+            urlencoding::encode(query), top
+        );
+        let resp = self.client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            anyhow::bail!("Search emails failed ({}): {}", status, &text[..text.len().min(300)]);
+        }
+        let data: serde_json::Value = serde_json::from_str(&text)?;
+        let emails = data.get("value")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(emails)
+    }
+
     async fn get<T: serde::de::DeserializeOwned>(&self, auth: &mut Auth, url: &str) -> Result<T> {
         let token = auth.access_token().await?;
         let resp = self.client
