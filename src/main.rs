@@ -445,15 +445,15 @@ async fn cmd_list() -> Result<()> {
 }
 
 async fn cmd_preview(path: &str) -> Result<()> {
-    // tv outputs lines like: path/to/file.txt:14:matched text
-    let file_path = path.split(':').next().unwrap_or(path);
+    // tv passes rg output lines like: /full/path/file.txt:14:matched text
+    // Extract file path (everything before first colon that follows .txt or similar)
+    let file_path = extract_file_path(path);
     let file_path = file_path.trim();
 
     let p = std::path::PathBuf::from(file_path);
     let resolved = if p.exists() {
         p
     } else {
-        // Try as relative to data dir
         let auth = auth::Auth::new()?;
         let data_path = auth.config_dir().join("data").join(file_path);
         if data_path.exists() {
@@ -464,9 +464,42 @@ async fn cmd_preview(path: &str) -> Result<()> {
         }
     };
 
+    // If this is a message file inside conversations/{id}/messages/,
+    // show all messages from that conversation for context
+    if let Some(parent) = resolved.parent() {
+        if parent.file_name().map(|n| n == "messages").unwrap_or(false) {
+            // Show all messages in this conversation
+            let mut files: Vec<_> = std::fs::read_dir(parent)?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().map(|e| e == "txt").unwrap_or(false))
+                .collect();
+            files.sort();
+            for f in files {
+                if let Ok(content) = std::fs::read_to_string(&f) {
+                    print!("{}", content);
+                }
+            }
+            return Ok(());
+        }
+    }
+
     let content = std::fs::read_to_string(&resolved)?;
     print!("{}", content);
     Ok(())
+}
+
+/// Extract file path from rg output line.
+/// rg format: /path/to/file.txt:linenum:matched text
+/// We find the .txt boundary and take everything before the colon after it.
+fn extract_file_path(line: &str) -> &str {
+    // Find .txt: pattern which marks end of file path
+    if let Some(pos) = line.find(".txt:") {
+        &line[..pos + 4] // include .txt
+    } else {
+        // Fallback: first colon-separated field
+        line.split(':').next().unwrap_or(line)
+    }
 }
 
 async fn cmd_send(conv_id: &str, message: Option<&str>, from_stdin: bool) -> Result<()> {
