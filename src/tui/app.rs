@@ -99,6 +99,7 @@ pub struct App {
     read_locally: HashMap<String, bool>,
 
     // Emails (Microsoft Graph)
+    email_folders: Vec<(String, String, Vec<serde_json::Value>)>, // (folder_name, folder_id, emails)
     emails: Vec<serde_json::Value>,
     current_email_id: Option<String>,
     current_email_body: Option<String>, // HTML body of selected email
@@ -146,6 +147,7 @@ impl App {
             last_message_ids: HashMap::new(),
             has_new_messages: HashMap::new(),
             read_locally: HashMap::new(),
+            email_folders: Vec::new(),
             emails: Vec::new(),
             current_email_id: None,
             current_email_body: None,
@@ -170,7 +172,7 @@ impl App {
         }
 
         // Load emails in background (don't block startup)
-        app.load_emails().await;
+        app.load_email_folders().await;
 
         // Load favourites from store
         if let Ok(store) = crate::store::Store::new(app.auth.config_dir()) {
@@ -875,9 +877,9 @@ impl App {
                 }
                 KeyCode::Char('r') => {
                     self.load_conversations().await;
-                    self.load_emails().await;
+                    self.load_email_folders().await;
                 }
-                KeyCode::Char('e') => self.load_emails().await,
+                KeyCode::Char('e') => self.load_email_folders().await,
                 KeyCode::Char('/') => {
                     if let Some((path, line)) = self.spawn_tv() {
                         self.navigate_to_tv_selection(&path, line).await;
@@ -1275,8 +1277,23 @@ impl App {
             }
         }
 
-        // 6. Emails
-        if !self.emails.is_empty() {
+        // 6. Emails - grouped by folder
+        if !self.email_folders.is_empty() {
+            section_starts.push(items.len());
+            items.push(SidebarItem::Header("Emails".to_string()));
+            for (folder_name, _, folder_emails) in &self.email_folders {
+                items.push(SidebarItem::Header(format!("  {} ({})", folder_name, folder_emails.len())));
+                for email in folder_emails {
+                    let email_id = email.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    if let Some(idx) = self.emails.iter().position(|e| {
+                        e.get("id").and_then(|v| v.as_str()) == Some(email_id)
+                    }) {
+                        items.push(SidebarItem::Email(idx));
+                    }
+                }
+            }
+        } else if !self.emails.is_empty() {
+            // Fallback: flat list if email_folders not loaded yet
             section_starts.push(items.len());
             items.push(SidebarItem::Header(format!("Emails ({})", self.emails.len())));
             for idx in 0..self.emails.len() {
@@ -1510,23 +1527,38 @@ impl App {
         }
     }
 
-    async fn load_emails(&mut self) {
-        self.status = "Loading emails...".to_string();
-        match self.api.list_emails(&mut self.auth, "inbox", 25).await {
-            Ok(emails) => {
-                let count = emails.len();
-                self.emails = emails;
+    async fn load_email_folders(&mut self) {
+        self.status = "Loading email folders...".to_string();
+        match self.api.list_mail_folders(&mut self.auth).await {
+            Ok(folders) => {
+                let mut loaded = Vec::new();
+                for folder in &folders {
+                    let name = folder.get("displayName").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                    let id = folder.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let total = folder.get("totalItemCount").and_then(|v| v.as_u64()).unwrap_or(0);
+                    if total == 0 || id.is_empty() {
+                        continue;
+                    }
+                    match self.api.list_emails(&mut self.auth, &id, 15).await {
+                        Ok(emails) => {
+                            if !emails.is_empty() {
+                                loaded.push((name, id, emails));
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+                self.email_folders = loaded;
+                // Flatten into self.emails for backward compat
+                self.emails = self.email_folders.iter()
+                    .flat_map(|(_, _, emails)| emails.clone())
+                    .collect();
                 self.email_loaded = true;
                 self.rebuild_sidebar();
-                self.status = format!(
-                    "{} conversations, {} emails",
-                    self.conversations.len(),
-                    count,
-                );
+                self.status = format!("{} conversations, {} email folders", self.conversations.len(), self.email_folders.len());
             }
             Err(e) => {
-                // Keep error visible - don't overwrite
-                self.status = format!("Emails failed: {} (press 'e' to retry)", e);
+                self.status = format!("Email folders failed: {} (press 'e' to retry)", e);
                 self.email_loaded = true;
             }
         }
