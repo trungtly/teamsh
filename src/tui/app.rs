@@ -32,7 +32,6 @@ enum Focus {
     Sidebar,
     Messages,
     Input,
-    Search,
 }
 
 /// Sidebar item: either a section header or a conversation/email entry
@@ -81,12 +80,6 @@ pub struct App {
     next_color_idx: usize,
 
     // Search
-    search_active: bool,
-    search_query: String,
-    search_results: Vec<usize>,       // conversation indices
-    search_email_results: Vec<usize>, // email indices
-    search_list_state: ListState,
-    search_people_results: Vec<(String, String)>,
     search_highlight: String, // active search term to highlight in message view
 
     // Message content cache for search
@@ -151,12 +144,6 @@ impl App {
             my_name: String::new(),
             sender_colors: HashMap::new(),
             next_color_idx: 0,
-            search_active: false,
-            search_query: String::new(),
-            search_results: Vec::new(),
-            search_list_state: ListState::default(),
-            search_email_results: Vec::new(),
-            search_people_results: Vec::new(),
             search_highlight: String::new(),
             cached_snippets: HashMap::new(),
             tick_count: 0,
@@ -259,11 +246,6 @@ impl App {
     // --- Drawing ---
 
     fn draw(&mut self, frame: &mut Frame) {
-        if self.search_active {
-            self.draw_search(frame);
-            return;
-        }
-
         let area = frame.area();
 
         // Split: sidebar (25%) | main (75%)
@@ -597,8 +579,8 @@ impl App {
         // Help
         let help = match self.focus {
             Focus::Input => " Enter:send  Esc:cancel ",
-            Focus::Messages => " j/k:scroll  PgUp/Dn  G:end  g:top  h:sidebar  i:compose  /:search  r:refresh ",
-            _ => " Tab:section  j/k:nav  l:messages  /:search  f:fav  r:refresh  e:emails  q:quit ",
+            Focus::Messages => " j/k:scroll  PgUp/Dn  G:end  g:top  h:sidebar  i:compose  /:tv-search  r:refresh ",
+            _ => " Tab:section  j/k:nav  l:messages  /:tv-search  f:fav  r:refresh  e:emails  q:quit ",
         };
         let help_widget = Paragraph::new(
             Line::from(help).style(Style::default().fg(Color::DarkGray)),
@@ -662,15 +644,9 @@ impl App {
 
             // Rich content lines with formatting
             let rich_lines = html::strip_html_rich(content);
-            let highlight = &self.search_highlight;
             for rich_line in &rich_lines {
                 let mut spans = vec![Span::raw("  ".to_string())];
                 spans.extend(html::rich_to_spans(rich_line));
-
-                // Apply search highlighting if active
-                if !highlight.is_empty() {
-                    spans = apply_search_highlight(spans, highlight);
-                }
 
                 let line_text: String = spans.iter().map(|s| s.content.as_ref()).collect();
                 if line_text.len() > width && width > 4 {
@@ -771,11 +747,7 @@ impl App {
         let body_html = self.current_email_body.as_deref().unwrap_or("Loading...");
         let rich_lines = html::strip_html_rich(body_html);
         for rich_line in &rich_lines {
-            let mut spans = html::rich_to_spans(rich_line);
-
-            if !self.search_highlight.is_empty() {
-                spans = apply_search_highlight(spans, &self.search_highlight);
-            }
+            let spans = html::rich_to_spans(rich_line);
 
             let line_text: String = spans.iter().map(|s| s.content.as_ref()).collect();
             if line_text.len() > width && width > 4 {
@@ -795,130 +767,9 @@ impl App {
         lines
     }
 
-    fn draw_search(&mut self, frame: &mut Frame) {
-        let area = frame.area();
-        let [input_area, results_area, status_area] = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .areas(area);
-
-        let input = Paragraph::new(self.search_query.as_str()).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Search ")
-                .border_style(Style::default().fg(Color::Cyan)),
-        );
-        frame.render_widget(input, input_area);
-        frame.set_cursor_position((
-            input_area.x + 1 + self.search_query.width() as u16,
-            input_area.y + 1,
-        ));
-
-        let mut items: Vec<ListItem> = Vec::new();
-
-        for &idx in &self.search_results {
-            if let Some(conv) = self.conversations.get(idx) {
-                let kind = conv.kind();
-                if matches!(kind, ConvKind::System) {
-                    continue;
-                }
-                let prefix = match kind {
-                    ConvKind::Channel => "# ",
-                    ConvKind::Chat => "@ ",
-                    ConvKind::Meeting => "M ",
-                    ConvKind::System => continue,
-                };
-                let name = conv.display_name(&self.my_name);
-                let read_local = self.read_locally.get(&conv.id).copied().unwrap_or(false);
-                let unread = if read_local {
-                    self.has_new_messages.get(&conv.id).copied().unwrap_or(false)
-                } else {
-                    conv.is_unread()
-                        || self.has_new_messages.get(&conv.id).copied().unwrap_or(false)
-                };
-                let style = if unread {
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                items.push(ListItem::new(
-                    Line::from(format!(" {}{}", prefix, name)).style(style),
-                ));
-            }
-        }
-
-        // Email search results
-        if !self.search_email_results.is_empty() {
-            items.push(ListItem::new(
-                Line::from(" Emails")
-                    .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            ));
-            for &idx in &self.search_email_results {
-                if let Some(email) = self.emails.get(idx) {
-                    let subject = email.get("subject").and_then(|v| v.as_str()).unwrap_or("(no subject)");
-                    let from = email.get("from")
-                        .and_then(|v| v.get("emailAddress"))
-                        .and_then(|v| v.get("name"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?");
-                    items.push(ListItem::new(
-                        Line::from(format!("   {} - {}", from, subject)),
-                    ));
-                }
-            }
-        }
-
-        if !self.search_people_results.is_empty() {
-            if !items.is_empty() {
-                items.push(ListItem::new(""));
-            }
-            items.push(ListItem::new(
-                Line::from(" People")
-                    .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            ));
-            for (name, email) in &self.search_people_results {
-                let label = if email.is_empty() {
-                    format!("   {}", name)
-                } else {
-                    format!("   {} ({})", name, email)
-                };
-                items.push(ListItem::new(label));
-            }
-        }
-
-        let total = self.search_results.len() + self.search_people_results.len();
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" {} results ", total)),
-            )
-            .highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            );
-        frame.render_stateful_widget(list, results_area, &mut self.search_list_state);
-
-        let status = Paragraph::new(
-            Line::from(" Type to filter  Enter:open  Esc:cancel  j/k:nav ")
-                .style(Style::default().fg(Color::DarkGray)),
-        );
-        frame.render_widget(status, status_area);
-    }
-
     // --- Key handling ---
 
     async fn handle_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
-        if self.search_active {
-            self.handle_search_key(key).await;
-            return;
-        }
-
         match &self.focus {
             Focus::Sidebar => match key {
                 KeyCode::Char('q') => self.exit = true,
@@ -1094,9 +945,6 @@ impl App {
                 }
                 _ => {}
             },
-            Focus::Search => {
-                self.handle_search_key(key).await;
-            }
         }
     }
 
@@ -1120,9 +968,6 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                if self.search_active {
-                    return;
-                }
                 if self.in_area(col, row, self.sidebar_area) {
                     self.focus = Focus::Sidebar;
                     // Calculate which sidebar item was clicked
@@ -1147,54 +992,6 @@ impl App {
 
     fn in_area(&self, col: u16, row: u16, area: Rect) -> bool {
         col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
-    }
-
-    async fn handle_search_key(&mut self, key: KeyCode) {
-        match key {
-            KeyCode::Esc => {
-                self.close_search();
-                self.focus = Focus::Sidebar;
-            }
-            KeyCode::Enter => {
-                self.open_search_result().await;
-            }
-            KeyCode::Down | KeyCode::Tab => {
-                let total = self.search_total_items();
-                if total > 0 {
-                    let i = self
-                        .search_list_state
-                        .selected()
-                        .map(|i| (i + 1).min(total - 1))
-                        .unwrap_or(0);
-                    self.search_list_state.select(Some(i));
-                }
-            }
-            KeyCode::Up => {
-                let i = self
-                    .search_list_state
-                    .selected()
-                    .map(|i| i.saturating_sub(1))
-                    .unwrap_or(0);
-                self.search_list_state.select(Some(i));
-            }
-            KeyCode::Backspace => {
-                self.search_query.pop();
-                self.update_search_results();
-                if self.search_query.len() >= 3 {
-                    self.remote_search().await;
-                } else {
-                    self.search_people_results.clear();
-                }
-            }
-            KeyCode::Char(c) => {
-                self.search_query.push(c);
-                self.update_search_results();
-                if self.search_query.len() >= 3 {
-                    self.remote_search().await;
-                }
-            }
-            _ => {}
-        }
     }
 
     // --- Sidebar navigation ---
@@ -1961,151 +1758,6 @@ impl App {
         }
     }
 
-    // --- Search ---
-
-    fn update_search_results(&mut self) {
-        use nucleo_matcher::{Matcher, Config, Utf32Str};
-        use nucleo_matcher::pattern::{Pattern, CaseMatching, Normalization, AtomKind};
-
-        let query = &self.search_query;
-
-        if query.is_empty() {
-            // Show all non-system conversations and all emails
-            self.search_results = self.conversations.iter().enumerate()
-                .filter(|(_, conv)| !matches!(conv.kind(), ConvKind::System))
-                .map(|(i, _)| i)
-                .collect();
-            self.search_email_results = (0..self.emails.len()).collect();
-        } else {
-            let mut matcher = Matcher::new(Config::DEFAULT);
-            let pattern = Pattern::new(query, CaseMatching::Smart, Normalization::Smart, AtomKind::Fuzzy);
-            let mut buf = Vec::new();
-
-            // Fuzzy match conversations - score each individually
-            let mut conv_scored: Vec<(usize, u32)> = Vec::new();
-            for (i, conv) in self.conversations.iter().enumerate() {
-                if matches!(conv.kind(), ConvKind::System) { continue; }
-                let mut text = conv.display_name(&self.my_name);
-                let topic = conv.topic();
-                if topic != "(no topic)" {
-                    text = format!("{} {}", text, topic);
-                }
-                for member in &conv.member_names {
-                    text = format!("{} {}", text, member);
-                }
-                if let Some(snippets) = self.cached_snippets.get(&conv.id) {
-                    for s in snippets.iter().take(3) {
-                        text = format!("{} {}", text, s);
-                    }
-                }
-                let haystack = Utf32Str::new(&text, &mut buf);
-                if let Some(score) = pattern.score(haystack, &mut matcher) {
-                    conv_scored.push((i, score));
-                }
-            }
-            conv_scored.sort_by(|a, b| b.1.cmp(&a.1));
-            self.search_results = conv_scored.into_iter().map(|(i, _)| i).collect();
-
-            // Fuzzy match emails
-            let mut email_scored: Vec<(usize, u32)> = Vec::new();
-            for (i, email) in self.emails.iter().enumerate() {
-                let subject = email.get("subject").and_then(|v| v.as_str()).unwrap_or("");
-                let from = email.get("from")
-                    .and_then(|v| v.get("emailAddress"))
-                    .and_then(|v| v.get("name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let preview = email.get("bodyPreview").and_then(|v| v.as_str()).unwrap_or("");
-                let text = format!("{} {} {}", subject, from, preview);
-                let haystack = Utf32Str::new(&text, &mut buf);
-                if let Some(score) = pattern.score(haystack, &mut matcher) {
-                    email_scored.push((i, score));
-                }
-            }
-            email_scored.sort_by(|a, b| b.1.cmp(&a.1));
-            self.search_email_results = email_scored.into_iter().map(|(i, _)| i).collect();
-        }
-
-        let total = self.search_results.len() + self.search_email_results.len();
-        if total > 0 {
-            self.search_list_state.select(Some(0));
-        } else {
-            self.search_list_state.select(None);
-        }
-    }
-
-    fn search_total_items(&self) -> usize {
-        let mut count = self.search_results.len();
-        if !self.search_email_results.is_empty() {
-            count += 1 + self.search_email_results.len(); // +1 for header
-        }
-        if !self.search_people_results.is_empty() {
-            count += 2 + self.search_people_results.len();
-        }
-        count
-    }
-
-    async fn remote_search(&mut self) {
-        if let Ok(results) = self
-            .api
-            .search_people(&mut self.auth, &self.search_query)
-            .await
-        {
-            self.search_people_results = results;
-        }
-    }
-
-    async fn open_search_result(&mut self) {
-        let selected_idx = self.search_list_state.selected();
-        if selected_idx.is_none() { return; }
-        let sel = selected_idx.unwrap();
-
-        // Determine what was selected: conversation, email header, email, or people
-        let conv_count = self.search_results.len();
-        let _email_header_offset = conv_count;
-        let email_start = if self.search_email_results.is_empty() { conv_count } else { conv_count + 1 };
-        let email_end = email_start + self.search_email_results.len();
-
-        if sel < conv_count {
-            // Conversation result
-            if let Some(&conv_idx) = self.search_results.get(sel) {
-                if let Some(conv) = self.conversations.get(conv_idx) {
-                    let id = conv.id.clone();
-                    let topic = conv.display_name(&self.my_name);
-                    self.has_new_messages.insert(id.clone(), false);
-                    self.read_locally.insert(id.clone(), true);
-                    self.current_email_id = None;
-                    self.current_email_body = None;
-                    self.current_conv_id = Some(id);
-                    self.current_conv_topic = topic;
-                    self.search_highlight = self.search_query.clone();
-                    self.close_search();
-                    self.focus = Focus::Messages;
-                    self.load_messages().await;
-                    self.scroll_offset = usize::MAX;
-                }
-            }
-        } else if sel >= email_start && sel < email_end {
-            // Email result
-            let email_idx_pos = sel - email_start;
-            if let Some(&email_idx) = self.search_email_results.get(email_idx_pos) {
-                self.search_highlight = self.search_query.clone();
-                self.close_search();
-                self.focus = Focus::Messages;
-                self.preview_email(email_idx).await;
-            }
-        }
-        // Headers and people results are not openable
-    }
-
-    fn close_search(&mut self) {
-        self.search_active = false;
-        self.search_query.clear();
-        self.search_results.clear();
-        self.search_email_results.clear();
-        self.search_people_results.clear();
-    }
-
     // --- Polling ---
 
     async fn poll_new_messages(&mut self) {
@@ -2167,54 +1819,6 @@ impl App {
             Err(_) => {}
         }
     }
-}
-
-/// Split spans to highlight search matches with a bright background.
-fn apply_search_highlight(spans: Vec<Span<'static>>, query: &str) -> Vec<Span<'static>> {
-    let query_lower = query.to_lowercase();
-    let query_lower_len = query_lower.len();
-    let mut result = Vec::new();
-    for span in spans {
-        let text = span.content.to_string();
-        let text_lower = text.to_lowercase();
-        if !text_lower.contains(&query_lower) {
-            result.push(span);
-            continue;
-        }
-        // Map byte positions in lowercase back to original text
-        // For ASCII this is 1:1, for Unicode we iterate both in sync
-        let base_style = span.style;
-        let hl_style = base_style.bg(Color::Yellow).fg(Color::Black);
-        let mut pos = 0; // byte position in text_lower
-        loop {
-            if let Some(idx) = text_lower[pos..].find(&query_lower) {
-                let match_start = pos + idx;
-                let match_end = match_start + query_lower_len;
-                // Find corresponding byte positions in original text
-                let orig_start = byte_pos_in_original(&text, match_start);
-                let orig_end = byte_pos_in_original(&text, match_end);
-                let before_start = byte_pos_in_original(&text, pos);
-                if orig_start > before_start {
-                    result.push(Span::styled(text[before_start..orig_start].to_string(), base_style));
-                }
-                result.push(Span::styled(text[orig_start..orig_end].to_string(), hl_style));
-                pos = match_end;
-            } else {
-                let orig_pos = byte_pos_in_original(&text, pos);
-                if orig_pos < text.len() {
-                    result.push(Span::styled(text[orig_pos..].to_string(), base_style));
-                }
-                break;
-            }
-        }
-    }
-    result
-}
-
-/// Map a byte position in the lowercased string to the corresponding byte position
-/// in the original string. For ASCII text (which covers most Teams messages) these are identical.
-fn byte_pos_in_original(original: &str, lower_pos: usize) -> usize {
-    lower_pos.min(original.len())
 }
 
 /// Wrap a text string to fit within `width` columns, respecting Unicode width.
