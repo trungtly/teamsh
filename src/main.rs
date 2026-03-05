@@ -2,6 +2,7 @@ mod api;
 mod auth;
 mod cache;
 mod cli;
+mod store;
 mod html;
 mod tui;
 mod types;
@@ -34,6 +35,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Green { hours, keep }) => {
             cmd_green(*hours, *keep).await?;
+        }
+        Some(Commands::Emails { last }) => {
+            cmd_emails(*last).await?;
         }
         Some(Commands::Tui) | None => {
             tui::run().await?;
@@ -214,6 +218,32 @@ async fn cmd_green(hours: u64, keep: bool) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn cmd_emails(last: u32) -> Result<()> {
+    let mut auth = auth::Auth::new()?;
+    let api = api::Api::new(&auth.region());
+    println!("Fetching {} emails from inbox...", last);
+    match api.list_emails(&mut auth, "inbox", last).await {
+        Ok(emails) => {
+            println!("Got {} emails:", emails.len());
+            for email in &emails {
+                let subject = email.get("subject").and_then(|v| v.as_str()).unwrap_or("?");
+                let from = email.get("from")
+                    .and_then(|v| v.get("emailAddress"))
+                    .and_then(|v| v.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let is_read = email.get("isRead").and_then(|v| v.as_bool()).unwrap_or(true);
+                let marker = if is_read { " " } else { "*" };
+                println!("{} {} - {}", marker, from, subject);
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+        }
+    }
     Ok(())
 }
 
