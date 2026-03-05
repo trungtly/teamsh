@@ -70,6 +70,13 @@ pub enum Commands {
     },
     /// Sync conversations and emails to local files
     Sync,
+    /// List conversations and emails (for tv integration)
+    List,
+    /// Preview a conversation or email file (for tv integration)
+    Preview {
+        /// File path (from tv selection, may include :line:text suffix)
+        path: String,
+    },
     /// Launch TUI mode
     Tui,
 }

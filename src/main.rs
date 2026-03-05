@@ -42,6 +42,12 @@ async fn main() -> Result<()> {
         Some(Commands::Sync) => {
             cmd_sync().await?;
         }
+        Some(Commands::List) => {
+            cmd_list().await?;
+        }
+        Some(Commands::Preview { path }) => {
+            cmd_preview(path).await?;
+        }
         Some(Commands::Tui) | None => {
             tui::run().await?;
         }
@@ -394,6 +400,72 @@ async fn cmd_sync() -> Result<()> {
     );
     eprintln!("Data dir: {:?}", store.data_dir());
 
+    Ok(())
+}
+
+async fn cmd_list() -> Result<()> {
+    let auth = auth::Auth::new()?;
+    let store = store::Store::new(auth.config_dir())?;
+    let index = store.load_index()?;
+
+    // Conversations
+    for conv in &index.conversations {
+        let marker = if conv.unread { "*" } else { " " };
+        let prefix = match conv.kind.as_str() {
+            "channel" => "#",
+            "chat" => "@",
+            "meeting" => "M",
+            _ => "?",
+        };
+        println!("{}{} {}\t{}", marker, prefix, conv.name, conv.id);
+    }
+
+    // Emails
+    for folder in &index.email_folders {
+        let files = store.list_email_files(&folder.name)?;
+        for filepath in &files {
+            let content = std::fs::read_to_string(filepath)?;
+            let mut from = "";
+            let mut subject = "";
+            for line in content.lines() {
+                if let Some(v) = line.strip_prefix("From: ") {
+                    from = v;
+                } else if let Some(v) = line.strip_prefix("Subject: ") {
+                    subject = v;
+                }
+                if !from.is_empty() && !subject.is_empty() {
+                    break;
+                }
+            }
+            println!("  {} - {} [{}]", from, subject, filepath.display());
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_preview(path: &str) -> Result<()> {
+    // tv outputs lines like: path/to/file.txt:14:matched text
+    let file_path = path.split(':').next().unwrap_or(path);
+    let file_path = file_path.trim();
+
+    let p = std::path::PathBuf::from(file_path);
+    let resolved = if p.exists() {
+        p
+    } else {
+        // Try as relative to data dir
+        let auth = auth::Auth::new()?;
+        let data_path = auth.config_dir().join("data").join(file_path);
+        if data_path.exists() {
+            data_path
+        } else {
+            eprintln!("File not found: {}", file_path);
+            return Ok(());
+        }
+    };
+
+    let content = std::fs::read_to_string(&resolved)?;
+    print!("{}", content);
     Ok(())
 }
 
