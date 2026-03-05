@@ -1554,20 +1554,27 @@ impl App {
 
     /// Suspend TUI, spawn tv for search, return selected file path and line number
     fn spawn_tv(&mut self) {
+        use std::io::Write;
         use std::process::Command;
 
         let data_dir = self.auth.config_dir().join("data");
         let data_path = data_dir.to_string_lossy();
 
-        // Suspend TUI
+        // Suspend TUI completely
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::event::DisableMouseCapture,
             crossterm::terminal::LeaveAlternateScreen,
         );
         let _ = crossterm::terminal::disable_raw_mode();
+        let _ = std::io::stdout().flush();
 
-        // Spawn tv with rg as source, preview shows the matched file
+        // Preview: extract file path from rg line, then cat all .txt in parent dir
+        // rg line format: /full/path/to/file.txt:linenum:content
+        // For messages dir: cat all sibling .txt files for full conversation context
+        // For emails: cat the single file
+        let preview_script = r#"f=$(echo '{}' | sed 's/:[0-9]*:.*$//'); d=$(dirname "$f"); if [ "$(basename "$d")" = "messages" ]; then cat "$d"/*.txt 2>/dev/null; else cat "$f" 2>/dev/null; fi"#;
+
         let source_cmd = format!(
             "rg . --no-heading --line-number --color=never {}",
             data_path
@@ -1576,7 +1583,7 @@ impl App {
             .arg("--source-command")
             .arg(&source_cmd)
             .arg("--preview-command")
-            .arg("teamsh preview '{}'")
+            .arg(preview_script)
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
@@ -1586,11 +1593,13 @@ impl App {
         let _ = crossterm::terminal::enable_raw_mode();
         let _ = crossterm::execute!(
             std::io::stdout(),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
             crossterm::terminal::EnterAlternateScreen,
             crossterm::event::EnableMouseCapture,
         );
+        let _ = std::io::stdout().flush();
 
-        // Force full redraw after returning from tv
+        // Force full redraw
         self.render_dirty = true;
     }
 
