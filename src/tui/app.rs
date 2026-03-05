@@ -98,6 +98,10 @@ pub struct App {
     // Track conversations read locally (to suppress stale unread from API)
     read_locally: HashMap<String, bool>,
 
+    // Render cache
+    cached_rendered_lines: Vec<Line<'static>>,
+    render_dirty: bool,
+
     // Emails (Microsoft Graph)
     email_folders: Vec<(String, String, Vec<serde_json::Value>)>, // (folder_name, folder_id, emails)
     emails: Vec<serde_json::Value>,
@@ -153,6 +157,8 @@ impl App {
             current_email_body: None,
             current_email_subject: String::new(),
             email_loaded: false,
+            cached_rendered_lines: Vec::new(),
+            render_dirty: true,
         };
 
         // Try loading from cache first for instant startup
@@ -196,6 +202,9 @@ impl App {
                     }
                     Event::Mouse(mouse) => {
                         self.handle_mouse(mouse).await;
+                    }
+                    Event::Resize(_, _) => {
+                        self.render_dirty = true;
                     }
                     _ => {}
                 }
@@ -471,10 +480,17 @@ impl App {
         self.view_height = view_height;
         self.msg_area = msg_area;
 
-        let wrapped_lines = if self.current_email_id.is_some() {
-            self.render_email(inner_width)
+        let wrapped_lines = if self.render_dirty {
+            let lines = if self.current_email_id.is_some() {
+                self.render_email(inner_width)
+            } else {
+                self.render_messages(inner_width)
+            };
+            self.cached_rendered_lines = lines.clone();
+            self.render_dirty = false;
+            lines
         } else {
-            self.render_messages(inner_width)
+            self.cached_rendered_lines.clone()
         };
         self.rendered_line_count = wrapped_lines.len();
 
@@ -1519,10 +1535,12 @@ impl App {
                     .unwrap_or("")
                     .to_string();
                 self.current_email_body = Some(body_html);
+                self.render_dirty = true;
             }
             Err(e) => {
                 self.status = format!("Email error: {}", e);
                 self.current_email_body = Some(format!("Error loading email: {}", e));
+                self.render_dirty = true;
             }
         }
     }
@@ -1832,6 +1850,7 @@ impl App {
                         self.cached_snippets.insert(conv_id.clone(), snippets);
                     }
                     self.messages = msgs;
+                    self.render_dirty = true;
                 }
                 Err(e) => {
                     self.status = format!("Error: {}", e);
