@@ -102,6 +102,9 @@ pub struct App {
     cached_rendered_lines: Vec<Line<'static>>,
     render_dirty: bool,
 
+    // New message indicator
+    has_new_below: bool,
+
     // Emails (Microsoft Graph)
     email_folders: Vec<(String, String, Vec<serde_json::Value>)>, // (folder_name, folder_id, emails)
     emails: Vec<serde_json::Value>,
@@ -159,6 +162,7 @@ impl App {
             email_loaded: false,
             cached_rendered_lines: Vec::new(),
             render_dirty: true,
+            has_new_below: false,
         };
 
         // Try loading from cache first for instant startup
@@ -530,6 +534,21 @@ impl App {
                     Style::default().fg(Color::DarkGray),
                 )),
                 ind_area,
+            );
+        }
+
+        // New messages indicator
+        if self.has_new_below {
+            let label = " New messages (G to jump) ";
+            let label_area = Rect::new(
+                msg_area.x + (msg_area.width / 2).saturating_sub(label.len() as u16 / 2),
+                msg_area.y + msg_area.height - 1,
+                label.len() as u16,
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(label, Style::default().fg(Color::Black).bg(Color::Yellow))),
+                label_area,
             );
         }
 
@@ -1025,6 +1044,7 @@ impl App {
                 KeyCode::Char('G') => {
                     // Jump to bottom
                     self.scroll_offset = self.rendered_line_count;
+                    self.has_new_below = false;
                 }
                 KeyCode::Char('g') => {
                     self.scroll_offset = 0;
@@ -2068,10 +2088,13 @@ impl App {
 
                 // Auto-reload messages for the currently open conversation
                 if current_conv_has_new {
-                    let was_at_bottom = self.scroll_offset >= self.rendered_line_count.saturating_sub(self.view_height);
+                    let at_bottom = self.scroll_offset >= self.rendered_line_count.saturating_sub(self.view_height + 5);
+                    self.render_dirty = true;
                     self.load_messages().await;
-                    if was_at_bottom {
+                    if at_bottom {
                         self.scroll_offset = usize::MAX; // stay at bottom
+                    } else {
+                        self.has_new_below = true;
                     }
                 }
 
