@@ -32,6 +32,9 @@ async fn main() -> Result<()> {
         Some(Commands::Search { query }) => {
             cmd_search(query).await?;
         }
+        Some(Commands::Green { hours, keep }) => {
+            cmd_green(*hours, *keep).await?;
+        }
         Some(Commands::Tui) | None => {
             tui::run().await?;
         }
@@ -188,6 +191,29 @@ async fn cmd_search(query: &str) -> Result<()> {
             println!("Error: {}", e);
         }
     }
+    Ok(())
+}
+
+async fn cmd_green(hours: u64, keep: bool) -> Result<()> {
+    let mut auth = auth::Auth::new()?;
+    let api = api::Api::new(&auth.region());
+
+    println!("Setting presence to Available for {} hours...", hours);
+    api.set_available(&mut auth, hours).await?;
+    println!("Status set to Available (green)");
+
+    if keep {
+        println!("Keeping alive (Ctrl+C to stop)...");
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(240)).await;
+            if let Err(e) = api.report_activity(&mut auth).await {
+                eprintln!("Activity report failed: {}", e);
+            } else {
+                println!("  activity reported");
+            }
+        }
+    }
+
     Ok(())
 }
 

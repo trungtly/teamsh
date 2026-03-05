@@ -443,11 +443,10 @@ impl App {
                 .unwrap_or("")
                 .get(11..16)
                 .unwrap_or("??:??");
-            let text = html::strip_html(content);
             let sender_color = self.sender_colors.get(sender).copied().unwrap_or(Color::Green);
             let is_me = !my_name.is_empty() && sender == my_name;
 
-            // Sender line: "HH:MM  SenderName"
+            // Sender line
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{} ", time),
@@ -461,16 +460,28 @@ impl App {
                 ),
             ]));
 
-            // Content lines with wrapping
-            for text_line in text.lines() {
-                let style = if text_line.starts_with("> ") {
-                    Style::default().fg(Color::DarkGray)
+            // Rich content lines with formatting
+            let rich_lines = html::strip_html_rich(content);
+            for rich_line in &rich_lines {
+                let mut spans = vec![Span::raw("  ".to_string())];
+                spans.extend(html::rich_to_spans(rich_line));
+                // Wrap: for now, create the line and let long lines get clipped
+                // TODO: proper span-aware wrapping
+                let line_text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+                if line_text.len() > width && width > 4 {
+                    // Simple wrapping: render as plain wrapped with style of first content span
+                    let style = if rich_line.iter().any(|s| s.quote) {
+                        Style::default().fg(Color::DarkGray)
+                    } else if rich_line.iter().any(|s| s.bold) {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    for wrapped in wrap_text(&format!("  {}", line_text.trim()), width) {
+                        lines.push(Line::from(Span::styled(wrapped, style)));
+                    }
                 } else {
-                    Style::default()
-                };
-                let prefixed = format!("  {}", text_line);
-                for wrapped in wrap_text(&prefixed, width) {
-                    lines.push(Line::from(Span::styled(wrapped, style)));
+                    lines.push(Line::from(spans));
                 }
             }
 
@@ -508,7 +519,6 @@ impl App {
                 }
             }
 
-            // Blank line between messages
             lines.push(Line::from(""));
         }
 
@@ -616,8 +626,14 @@ impl App {
         match &self.focus {
             Focus::Sidebar => match key {
                 KeyCode::Char('q') => self.exit = true,
-                KeyCode::Char('j') | KeyCode::Down => self.sidebar_next(),
-                KeyCode::Char('k') | KeyCode::Up => self.sidebar_prev(),
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.sidebar_next();
+                    self.preview_selected().await;
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.sidebar_prev();
+                    self.preview_selected().await;
+                }
                 KeyCode::Char('r') => self.load_conversations().await,
                 KeyCode::Char('/') => {
                     self.search_active = true;
@@ -862,6 +878,22 @@ impl App {
 
     // --- Actions ---
 
+    /// Auto-preview: load messages for the currently selected sidebar item
+    async fn preview_selected(&mut self) {
+        let conv_info = self.selected_conversation_idx().map(|idx| {
+            let conv = &self.conversations[idx];
+            (conv.id.clone(), conv.display_name(&self.my_name))
+        });
+        if let Some((id, topic)) = conv_info {
+            if self.current_conv_id.as_deref() != Some(&id) {
+                self.current_conv_id = Some(id);
+                self.current_conv_topic = topic;
+                self.load_messages().await;
+                self.scroll_offset = usize::MAX;
+            }
+        }
+    }
+
     async fn open_conversation(&mut self) {
         let conv_info = self.selected_conversation_idx().and_then(|idx| {
             let conv = &self.conversations[idx];
@@ -966,6 +998,9 @@ impl App {
 
     async fn load_conversations(&mut self) {
         self.status = "Loading conversations...".to_string();
+        // Clear polling state on full refresh
+        self.has_new_messages.clear();
+
         match self.api.list_conversations(&mut self.auth, 100).await {
             Ok(resp) => {
                 let mut convs = resp.conversations;
