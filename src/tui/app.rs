@@ -16,15 +16,24 @@ use crate::html;
 use crate::store;
 use crate::types::{Conversation, ConvKind, Message};
 
+// Catppuccin Mocha palette - matches teamsh bat theme
+const COLOR_TIMESTAMP: Color = Color::Rgb(137, 180, 250); // #89b4fa blue
+const COLOR_MENTION: Color = Color::Rgb(249, 226, 175);   // #f9e2af yellow
+const COLOR_QUOTE: Color = Color::Rgb(108, 112, 134);     // #6c7086 overlay0
+const COLOR_LINK: Color = Color::Rgb(137, 180, 250);      // #89b4fa blue
+const COLOR_LINK_TEXT: Color = Color::Rgb(116, 199, 236);  // #74c7ec sapphire
+const COLOR_ME: Color = Color::Rgb(203, 166, 247);         // #cba6f7 mauve
+const COLOR_HEADER: Color = Color::Rgb(137, 180, 250);     // #89b4fa blue
+
 const SENDER_COLORS: [Color; 8] = [
-    Color::Green,
-    Color::Cyan,
-    Color::Magenta,
-    Color::Yellow,
-    Color::Blue,
-    Color::Red,
-    Color::LightGreen,
-    Color::LightCyan,
+    Color::Rgb(166, 227, 161), // #a6e3a1 green
+    Color::Rgb(148, 226, 213), // #94e2d5 teal
+    Color::Rgb(245, 194, 231), // #f5c2e7 pink
+    Color::Rgb(249, 226, 175), // #f9e2af yellow
+    Color::Rgb(116, 199, 236), // #74c7ec sapphire
+    Color::Rgb(243, 139, 168), // #f38ba8 red
+    Color::Rgb(250, 179, 135), // #fab387 peach
+    Color::Rgb(180, 190, 254), // #b4befe lavender
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +41,7 @@ enum Focus {
     Sidebar,
     Messages,
     Input,
+    ThreadSearch,
 }
 
 /// Sidebar item: either a section header or a conversation/email entry
@@ -102,6 +112,15 @@ pub struct App {
     scroll_repeat_count: u32,
     last_scroll_time: std::time::Instant,
 
+    // In-thread search
+    thread_search_query: String,
+    thread_search_input: String,
+
+    // Text selection (character-level in message panel)
+    select_start: Option<(usize, usize)>, // (line, col) in cached_rendered_lines
+    select_end: Option<(usize, usize)>,
+    selecting: bool, // mouse drag in progress
+
     // Emails (Microsoft Graph)
     email_folders: Vec<(String, String, Vec<serde_json::Value>)>, // (folder_name, folder_id, emails)
     emails: Vec<serde_json::Value>,
@@ -146,6 +165,11 @@ impl App {
             last_message_ids: HashMap::new(),
             has_new_messages: HashMap::new(),
             read_locally: HashMap::new(),
+            thread_search_query: String::new(),
+            thread_search_input: String::new(),
+            select_start: None,
+            select_end: None,
+            selecting: false,
             email_folders: Vec::new(),
             emails: Vec::new(),
             current_email_id: None,
@@ -194,7 +218,7 @@ impl App {
                 match event::read()? {
                     Event::Key(key) => {
                         if key.kind == KeyEventKind::Press {
-                            self.handle_key(key.code, key.modifiers).await;
+                            self.handle_key(key.code, key.modifiers, terminal).await;
                         }
                     }
                     Event::Mouse(mouse) => {
@@ -442,10 +466,14 @@ impl App {
         }
 
         let is_email = self.current_email_id.is_some();
-        let [header_area, msg_area, input_area, help_area] = Layout::vertical([
+        let is_searching = self.focus == Focus::ThreadSearch;
+        let input_h = if is_email { 0 } else { 3 };
+        let search_h = if is_searching || !self.thread_search_query.is_empty() { 1 } else { 0 };
+        let [header_area, msg_area, search_area, input_area, help_area] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(if is_email { 0 } else { 3 }),
+            Constraint::Length(search_h),
+            Constraint::Length(input_h),
             Constraint::Length(1),
         ])
         .areas(area);
@@ -456,7 +484,7 @@ impl App {
             Span::styled(
                 &self.current_conv_topic,
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(COLOR_HEADER)
                     .add_modifier(Modifier::BOLD),
             ),
         ];
@@ -465,7 +493,7 @@ impl App {
 
         // Messages - manual wrapping for correct scroll
         let msg_border_color = if self.focus == Focus::Messages {
-            Color::Cyan
+            COLOR_HEADER
         } else {
             Color::DarkGray
         };
@@ -498,11 +526,57 @@ impl App {
             self.scroll_offset = max_scroll;
         }
 
-        // Slice visible lines
+        // Slice visible lines, highlighting selection
+        let sel = self.selection_normalized();
+        let sel_bg = Color::Rgb(49, 50, 68); // Catppuccin surface0
         let visible: Vec<Line> = wrapped_lines
             .into_iter()
+            .enumerate()
             .skip(self.scroll_offset)
             .take(view_height)
+            .map(|(i, line)| {
+                let Some((start, end)) = sel else { return line; };
+                if i < start.0 || i > end.0 { return line; }
+
+                // Determine selected char range on this line
+                let line_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
+                let sel_from = if i == start.0 { start.1.min(line_len) } else { 0 };
+                let sel_to = if i == end.0 { end.1.min(line_len) } else { line_len };
+                if sel_from >= sel_to && !(start.0 != end.0 && i > start.0 && i < end.0) {
+                    return line;
+                }
+
+                // Walk spans and split at selection boundaries
+                let mut new_spans: Vec<Span<'static>> = Vec::new();
+                let mut pos: usize = 0;
+                for span in line.spans {
+                    let slen = span.content.len();
+                    let s_start = pos;
+                    let s_end = pos + slen;
+                    pos = s_end;
+
+                    if s_end <= sel_from || s_start >= sel_to {
+                        // Entirely outside selection
+                        new_spans.push(span);
+                    } else {
+                        // Partially or fully inside selection
+                        let clip_from = sel_from.saturating_sub(s_start);
+                        let clip_to = (sel_to - s_start).min(slen);
+                        if clip_from > 0 {
+                            new_spans.push(Span::styled(
+                                span.content[..clip_from].to_string(), span.style));
+                        }
+                        new_spans.push(Span::styled(
+                            span.content[clip_from..clip_to].to_string(),
+                            span.style.bg(sel_bg)));
+                        if clip_to < slen {
+                            new_spans.push(Span::styled(
+                                span.content[clip_to..].to_string(), span.style));
+                        }
+                    }
+                }
+                Line::from(new_spans)
+            })
             .collect();
 
         let messages = Paragraph::new(visible).block(msg_block);
@@ -546,9 +620,30 @@ impl App {
             );
         }
 
+        // Thread search bar
+        if search_h > 0 {
+            let search_style = if is_searching {
+                Style::default().fg(COLOR_MENTION)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let prefix = Span::styled(" /", search_style);
+            let query = Span::styled(
+                &self.thread_search_input,
+                Style::default().fg(Color::White),
+            );
+            let search_line = Line::from(vec![prefix, query]);
+            frame.render_widget(Paragraph::new(search_line), search_area);
+            if is_searching {
+                let cursor_x = search_area.x + 2 + self.thread_search_input.width() as u16;
+                let cursor_x = cursor_x.min(search_area.x + search_area.width - 1);
+                frame.set_cursor_position((cursor_x, search_area.y));
+            }
+        }
+
         // Input
         let input_border = if self.focus == Focus::Input {
-            Color::Cyan
+            COLOR_HEADER
         } else {
             Color::DarkGray
         };
@@ -569,7 +664,8 @@ impl App {
         // Help
         let help = match self.focus {
             Focus::Input => " Enter:send  Esc:cancel ",
-            Focus::Messages => " j/k:scroll  PgUp/Dn  G:end  g:top  h:sidebar  i:compose  /:tv-search  r:refresh ",
+            Focus::ThreadSearch => " Enter:search  Esc:clear  type to filter ",
+            Focus::Messages => " j/k:scroll  G:end  g:top  f:find  n/N:next/prev  /:tv-search  i:compose  r:refresh ",
             _ => " Tab:section  j/k:nav  l:messages  /:tv-search  f:fav  r:refresh  e:emails  q:quit ",
         };
         let help_widget = Paragraph::new(
@@ -584,19 +680,10 @@ impl App {
             return Vec::new();
         }
 
-        // Pre-assign colors for all senders to avoid borrow issues
         let my_name = self.my_name.clone();
-        let senders: Vec<String> = self
-            .messages
-            .iter()
-            .filter_map(|m| m.imdisplayname.clone())
-            .collect();
-        for s in &senders {
-            self.color_for_sender(s);
-        }
 
-        let mut lines: Vec<Line<'static>> = Vec::new();
-
+        // Build plain text in the same format as stored .txt files
+        let mut plain = String::new();
         for m in &self.messages {
             let msgtype = m.messagetype.as_deref().unwrap_or("");
             if msgtype != "RichText/Html" && msgtype != "Text" {
@@ -610,46 +697,11 @@ impl App {
                 .unwrap_or(if my_name.is_empty() { "You" } else { &my_name });
             let content = m.content.as_deref().unwrap_or("");
             let timestamp_raw = m.timestamp.as_deref().unwrap_or("");
-            let time = format_timestamp(timestamp_raw);
-            let sender_color = self.sender_colors.get(sender).copied().unwrap_or(Color::Green);
-            let is_me = !my_name.is_empty() && sender == my_name;
+            let text = html::strip_html(content);
 
-            // Sender line
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{} ", time),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    sender.to_string(),
-                    Style::default()
-                        .fg(if is_me { Color::Yellow } else { sender_color })
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]));
-
-            // Rich content lines with formatting
-            let rich_lines = html::strip_html_rich(content);
-            for rich_line in &rich_lines {
-                let mut spans = vec![Span::raw("  ".to_string())];
-                spans.extend(html::rich_to_spans(rich_line));
-
-                let line_text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-                if line_text.len() > width && width > 4 {
-                    let style = if rich_line.iter().any(|s| s.quote) {
-                        Style::default().fg(Color::DarkGray)
-                    } else if rich_line.iter().any(|s| s.bold) {
-                        Style::default().add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                    };
-                    for wrapped in wrap_text(&format!("  {}", line_text.trim()), width) {
-                        lines.push(Line::from(Span::styled(wrapped, style)));
-                    }
-                } else {
-                    lines.push(Line::from(spans));
-                }
-            }
+            // Use the same format as stored files: "Name  Mar 05 14:32"
+            // Channel name is shown in the panel header, not repeated per message
+            plain.push_str(&store::format_message(sender, timestamp_raw, "", &text));
 
             // Reactions
             let reactions = m
@@ -678,17 +730,15 @@ impl App {
                     .collect::<Vec<_>>()
                     .join(" ");
                 if !reaction_str.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {}", reaction_str),
-                        Style::default().fg(Color::DarkGray),
-                    )));
+                    plain.push_str(&format!("  {}\n", reaction_str));
                 }
             }
 
-            lines.push(Line::from(""));
+            plain.push('\n');
         }
 
-        lines
+        // Pipe through bat for syntax highlighting
+        bat_highlight(&plain, width, &self.thread_search_query)
     }
 
     /// Render an email body into wrapped lines for the main panel.
@@ -718,36 +768,13 @@ impl App {
                 .get(..16)
                 .unwrap_or("?");
 
-            lines.push(Line::from(vec![
-                Span::styled("From: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(from, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("Date: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(date.to_string(), Style::default().fg(Color::DarkGray)),
-            ]));
-            lines.push(Line::from(""));
-        }
+            // Build email as plain text for bat
+            let mut plain = format!("From: {}\nDate: {}\n\n", from, date);
+            let body_html = self.current_email_body.as_deref().unwrap_or("Loading...");
+            let body_text = html::strip_html(body_html);
+            plain.push_str(&body_text);
 
-        // Email body
-        let body_html = self.current_email_body.as_deref().unwrap_or("Loading...");
-        let rich_lines = html::strip_html_rich(body_html);
-        for rich_line in &rich_lines {
-            let spans = html::rich_to_spans(rich_line);
-
-            let line_text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-            if line_text.len() > width && width > 4 {
-                let style = if rich_line.iter().any(|s| s.bold) {
-                    Style::default().add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                for wrapped in wrap_text(&line_text, width) {
-                    lines.push(Line::from(Span::styled(wrapped, style)));
-                }
-            } else {
-                lines.push(Line::from(spans));
-            }
+            return bat_highlight(&plain, width, &self.thread_search_query);
         }
 
         lines
@@ -755,7 +782,7 @@ impl App {
 
     // --- Key handling ---
 
-    async fn handle_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+    async fn handle_key(&mut self, key: KeyCode, modifiers: KeyModifiers, terminal: &mut DefaultTerminal) {
         match &self.focus {
             Focus::Sidebar => match key {
                 KeyCode::Char('q') => self.exit = true,
@@ -775,7 +802,7 @@ impl App {
                 }
                 KeyCode::Char('e') => self.load_email_folders().await,
                 KeyCode::Char('/') => {
-                    self.spawn_tv();
+                    self.spawn_tv(terminal);
                 }
                 KeyCode::Right | KeyCode::Char('l') => {
                     if self.current_conv_id.is_some() || self.current_email_id.is_some() {
@@ -861,10 +888,15 @@ impl App {
             },
             Focus::Messages => match key {
                 KeyCode::Esc => {
-                    self.focus = Focus::Sidebar;
+                    if self.select_start.is_some() {
+                        self.clear_selection();
+                    } else {
+                        self.focus = Focus::Sidebar;
+                    }
                 }
                 KeyCode::Left | KeyCode::Char('h') => {
                     self.focus = Focus::Sidebar;
+                    self.clear_selection();
                 }
                 KeyCode::Tab => {
                     self.focus = Focus::Sidebar;
@@ -904,7 +936,55 @@ impl App {
                 }
                 KeyCode::Char('r') => self.load_messages().await,
                 KeyCode::Char('/') => {
-                    self.spawn_tv();
+                    self.spawn_tv(terminal);
+                }
+                KeyCode::Char('f') => {
+                    // Enter in-thread search
+                    self.thread_search_input = self.thread_search_query.clone();
+                    self.focus = Focus::ThreadSearch;
+                }
+                KeyCode::Char('n') => {
+                    // Jump to next search match
+                    if !self.thread_search_query.is_empty() {
+                        self.jump_to_search_match(true);
+                    }
+                }
+                KeyCode::Char('N') => {
+                    // Jump to previous search match
+                    if !self.thread_search_query.is_empty() {
+                        self.jump_to_search_match(false);
+                    }
+                }
+                _ => {}
+            },
+            Focus::ThreadSearch => match key {
+                KeyCode::Enter => {
+                    self.thread_search_query = self.thread_search_input.clone();
+                    self.render_dirty = true;
+                    self.focus = Focus::Messages;
+                    // Jump to first match
+                    if !self.thread_search_query.is_empty() {
+                        self.scroll_offset = 0;
+                        self.jump_to_search_match(true);
+                    }
+                }
+                KeyCode::Esc => {
+                    self.thread_search_query.clear();
+                    self.thread_search_input.clear();
+                    self.render_dirty = true;
+                    self.focus = Focus::Messages;
+                }
+                KeyCode::Backspace => {
+                    self.thread_search_input.pop();
+                    // Live search as you type
+                    self.thread_search_query = self.thread_search_input.clone();
+                    self.render_dirty = true;
+                }
+                KeyCode::Char(c) => {
+                    self.thread_search_input.push(c);
+                    // Live search as you type
+                    self.thread_search_query = self.thread_search_input.clone();
+                    self.render_dirty = true;
                 }
                 _ => {}
             },
@@ -926,6 +1006,8 @@ impl App {
         }
     }
 
+    // --- Mouse handling (selection in message panel, clicks in sidebar) ---
+
     async fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         let col = mouse.column;
         let row = mouse.row;
@@ -946,22 +1028,37 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                if self.in_area(col, row, self.sidebar_area) {
+                if self.in_area(col, row, self.msg_area) {
+                    self.focus = Focus::Messages;
+                    let pos = self.mouse_to_pos(col, row);
+                    self.select_start = Some(pos);
+                    self.select_end = Some(pos);
+                    self.selecting = true;
+                } else if self.in_area(col, row, self.sidebar_area) {
                     self.focus = Focus::Sidebar;
-                    // Calculate which sidebar item was clicked
-                    // sidebar list has 1-line border top + 1-line status bottom
+                    self.clear_selection();
                     let visible_row = (row - self.sidebar_area.y).saturating_sub(1) as usize;
                     let list_offset = self.sidebar_state.offset();
                     let item_idx = list_offset + visible_row;
                     if item_idx < self.sidebar_items.len() {
                         if matches!(self.sidebar_items[item_idx], SidebarItem::Conv(_) | SidebarItem::Email(_)) {
                             self.sidebar_state.select(Some(item_idx));
-        
                             self.preview_selected().await;
                         }
                     }
-                } else if self.in_area(col, row, self.msg_area) {
-                    self.focus = Focus::Messages;
+                } else {
+                    self.clear_selection();
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.selecting && self.in_area(col, row, self.msg_area) {
+                    self.select_end = Some(self.mouse_to_pos(col, row));
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.selecting {
+                    self.selecting = false;
+                    self.copy_selection_to_clipboard();
                 }
             }
             _ => {}
@@ -970,6 +1067,84 @@ impl App {
 
     fn in_area(&self, col: u16, row: u16, area: Rect) -> bool {
         col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
+    }
+
+    /// Convert mouse (col, row) to (line_index, char_col) in cached_rendered_lines.
+    fn mouse_to_pos(&self, col: u16, row: u16) -> (usize, usize) {
+        let row_in_view = (row - self.msg_area.y).saturating_sub(1) as usize;
+        let line_idx = self.scroll_offset + row_in_view;
+        // Content starts after left border (1 char)
+        let char_col = (col - self.msg_area.x).saturating_sub(1) as usize;
+        (line_idx, char_col)
+    }
+
+    fn clear_selection(&mut self) {
+        self.select_start = None;
+        self.select_end = None;
+        self.selecting = false;
+    }
+
+    /// Normalize selection to (start, end) where start <= end in reading order.
+    fn selection_normalized(&self) -> Option<((usize, usize), (usize, usize))> {
+        match (self.select_start, self.select_end) {
+            (Some(a), Some(b)) => {
+                let (start, end) = if a.0 < b.0 || (a.0 == b.0 && a.1 <= b.1) {
+                    (a, b)
+                } else {
+                    (b, a)
+                };
+                Some((start, end))
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract the plain text of a line.
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// Copy selected text to clipboard.
+    fn copy_selection_to_clipboard(&mut self) {
+        let (start, end) = match self.selection_normalized() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let mut text = String::new();
+        for i in start.0..=end.0 {
+            if let Some(line) = self.cached_rendered_lines.get(i) {
+                let full = Self::line_text(line);
+                if start.0 == end.0 {
+                    // Single line: slice from start.col to end.col
+                    let from = start.1.min(full.len());
+                    let to = end.1.min(full.len());
+                    text.push_str(&full[from..to]);
+                } else if i == start.0 {
+                    let from = start.1.min(full.len());
+                    text.push_str(&full[from..]);
+                    text.push('\n');
+                } else if i == end.0 {
+                    let to = end.1.min(full.len());
+                    text.push_str(&full[..to]);
+                } else {
+                    text.push_str(&full);
+                    text.push('\n');
+                }
+            }
+        }
+
+        if text.is_empty() {
+            return;
+        }
+
+        // Use OSC 52 escape sequence to set terminal clipboard
+        use std::io::Write;
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+        let _ = write!(std::io::stdout(), "\x1b]52;c;{}\x07", encoded);
+        let _ = std::io::stdout().flush();
+        self.status = format!("Copied: {}", if text.len() > 40 { &text[..40] } else { &text });
     }
 
     // --- Sidebar navigation ---
@@ -1195,6 +1370,7 @@ impl App {
                     self.read_locally.insert(id.clone(), true);
                     self.current_email_id = None;
                     self.current_email_body = None;
+
                     self.current_conv_id = Some(id);
                     self.current_conv_topic = topic;
                     self.messages.clear();
@@ -1227,6 +1403,8 @@ impl App {
                 self.current_email_body = None;
                 self.current_conv_id = Some(id);
                 self.current_conv_topic = topic;
+                self.thread_search_query.clear();
+                self.thread_search_input.clear();
                 self.load_messages().await;
                 self.scroll_offset = usize::MAX;
             }
@@ -1553,7 +1731,7 @@ impl App {
     }
 
     /// Suspend TUI, spawn tv for search, return selected file path and line number
-    fn spawn_tv(&mut self) {
+    fn spawn_tv(&mut self, terminal: &mut DefaultTerminal) {
         use std::io::Write;
         use std::process::Command;
 
@@ -1569,38 +1747,69 @@ impl App {
         let _ = crossterm::terminal::disable_raw_mode();
         let _ = std::io::stdout().flush();
 
-        // Preview: extract file path from rg line, then cat all .txt in parent dir
-        // rg line format: /full/path/to/file.txt:linenum:content
-        // For messages dir: cat all sibling .txt files for full conversation context
-        // For emails: cat the single file
-        let preview_script = r#"f=$(echo '{}' | sed 's/:[0-9]*:.*$//'); d=$(dirname "$f"); if [ "$(basename "$d")" = "messages" ]; then cat "$d"/*.txt 2>/dev/null; else cat "$f" 2>/dev/null; fi"#;
+        let preview_script_path = self.auth.config_dir().join("tv-preview.sh");
+        let preview_cmd = format!("bash {} '{{}}'", preview_script_path.to_string_lossy());
 
         let source_cmd = format!(
-            "rg . --no-heading --line-number --color=never {}",
+            "rg . --no-heading --line-number --color=never --sortr=path {}",
             data_path
         );
         let _ = Command::new("tv")
             .arg("--source-command")
             .arg(&source_cmd)
             .arg("--preview-command")
-            .arg(preview_script)
+            .arg(&preview_cmd)
+            .arg("--preview-word-wrap")
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .status();
 
-        // Resume TUI
+        // Resume TUI - re-enter alternate screen and raw mode
         let _ = crossterm::terminal::enable_raw_mode();
         let _ = crossterm::execute!(
             std::io::stdout(),
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
             crossterm::terminal::EnterAlternateScreen,
             crossterm::event::EnableMouseCapture,
         );
         let _ = std::io::stdout().flush();
 
-        // Force full redraw
+        // Force ratatui to discard cached buffer and redraw from scratch
+        let _ = terminal.clear();
         self.render_dirty = true;
+    }
+
+    /// Jump scroll to the next (or previous) line matching the search query.
+    fn jump_to_search_match(&mut self, forward: bool) {
+        if self.thread_search_query.is_empty() || self.cached_rendered_lines.is_empty() {
+            return;
+        }
+        let query_lower = self.thread_search_query.to_lowercase();
+        let total = self.cached_rendered_lines.len();
+        let start = if forward {
+            self.scroll_offset + 1
+        } else {
+            self.scroll_offset.saturating_sub(1)
+        };
+
+        let range: Box<dyn Iterator<Item = usize>> = if forward {
+            Box::new((start..total).chain(0..start))
+        } else {
+            Box::new((0..=start).rev().chain((start + 1..total).rev()))
+        };
+
+        for i in range {
+            let line_text: String = self.cached_rendered_lines[i]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            if line_text.to_lowercase().contains(&query_lower) {
+                // Position match near top of viewport
+                self.scroll_offset = i.saturating_sub(2);
+                return;
+            }
+        }
     }
 
     async fn load_messages(&mut self) {
@@ -1637,7 +1846,7 @@ impl App {
                             let sender = m.imdisplayname.as_deref().unwrap_or("?");
                             let timestamp = m.timestamp.as_deref().unwrap_or("");
                             let content = m.content.as_deref().unwrap_or("");
-                            let _ = self.store.save_message(conv_id, msg_id, timestamp, sender, content);
+                            let _ = self.store.save_message(conv_id, msg_id, timestamp, sender, "", content);
                         }
                     }
                 }
@@ -1732,44 +1941,81 @@ impl App {
 }
 
 /// Wrap a text string to fit within `width` columns, respecting Unicode width.
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![text.to_string()];
-    }
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    let mut current_width = 0;
+/// Pipe plain text through bat for syntax highlighting, then parse ANSI into ratatui Lines.
+/// If bat is unavailable, returns plain unstyled lines. Wraps to width.
+/// If `search_query` is non-empty, highlights matching text with a background color.
+fn bat_highlight(plain: &str, width: usize, search_query: &str) -> Vec<Line<'static>> {
+    use ansi_to_tui::IntoText;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
 
-    for ch in text.chars() {
-        let ch_width = if ch == '\t' { 4 } else { UnicodeWidthStr::width(ch.encode_utf8(&mut [0; 4])) };
-        if current_width + ch_width > width && current_width > 0 {
-            lines.push(current.clone());
-            current.clear();
-            current_width = 0;
+    let term_width = format!("--terminal-width={}", width);
+
+    let output = Command::new("bat")
+        .args([
+            "--language=teamsmsg",
+            "--theme=teamsh",
+            "--style=plain",
+            "--color=always",
+            "--paging=never",
+            "--wrap=character",
+            &term_width,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .and_then(|mut child| {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(plain.as_bytes());
+            }
+            child.wait_with_output()
+        });
+
+    let mut lines: Vec<Line<'static>> = match output {
+        Ok(out) => {
+            match out.stdout.into_text() {
+                Ok(text) => text.lines,
+                Err(_) => plain.lines().map(|l| Line::from(l.to_string())).collect(),
+            }
         }
-        current.push(ch);
-        current_width += ch_width;
+        Err(_) => plain.lines().map(|l| Line::from(l.to_string())).collect(),
+    };
+
+    // Apply search highlighting if query is present
+    if !search_query.is_empty() {
+        let query_lower = search_query.to_lowercase();
+        let hl_style = Style::default()
+            .bg(Color::Rgb(250, 179, 135))  // Catppuccin peach bg
+            .fg(Color::Rgb(17, 17, 27));     // Catppuccin crust fg
+        for line in &mut lines {
+            let full_text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            let text_lower = full_text.to_lowercase();
+            if text_lower.contains(&query_lower) {
+                // Rebuild spans with highlights
+                let mut new_spans: Vec<Span<'static>> = Vec::new();
+                for span in &line.spans {
+                    let span_text = span.content.as_ref();
+                    let span_lower = span_text.to_lowercase();
+                    if let Some(pos) = span_lower.find(&query_lower) {
+                        if pos > 0 {
+                            new_spans.push(Span::styled(span_text[..pos].to_string(), span.style));
+                        }
+                        let end = pos + search_query.len();
+                        let end = end.min(span_text.len());
+                        new_spans.push(Span::styled(span_text[pos..end].to_string(), hl_style));
+                        if end < span_text.len() {
+                            new_spans.push(Span::styled(span_text[end..].to_string(), span.style));
+                        }
+                    } else {
+                        new_spans.push(span.clone());
+                    }
+                }
+                *line = Line::from(new_spans);
+            }
+        }
     }
-    if !current.is_empty() || lines.is_empty() {
-        lines.push(current);
-    }
+
     lines
 }
 
-/// Format ISO 8601 timestamp to "Mar 05 14:32" style.
-fn format_timestamp(ts: &str) -> String {
-    // Input: "2026-03-05T14:32:00.000Z"
-    if ts.len() < 16 {
-        return "??:??".to_string();
-    }
-    let month = match ts.get(5..7) {
-        Some("01") => "Jan", Some("02") => "Feb", Some("03") => "Mar",
-        Some("04") => "Apr", Some("05") => "May", Some("06") => "Jun",
-        Some("07") => "Jul", Some("08") => "Aug", Some("09") => "Sep",
-        Some("10") => "Oct", Some("11") => "Nov", Some("12") => "Dec",
-        _ => "???",
-    };
-    let day = ts.get(8..10).unwrap_or("??");
-    let time = ts.get(11..16).unwrap_or("??:??");
-    format!("{} {} {}", month, day, time)
-}

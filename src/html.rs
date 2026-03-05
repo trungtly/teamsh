@@ -89,11 +89,17 @@ pub fn strip_html_rich(html: &str) -> Vec<Vec<RichSegment>> {
 }
 
 /// Convert RichSegments to ratatui Spans for rendering
+// Catppuccin Mocha palette - matches teamsh bat theme
+const COLOR_MENTION: Color = Color::Rgb(249, 226, 175);  // #f9e2af yellow
+const COLOR_QUOTE: Color = Color::Rgb(108, 112, 134);    // #6c7086 overlay0
+const COLOR_LINK: Color = Color::Rgb(137, 180, 250);     // #89b4fa blue
+const COLOR_LINK_TEXT: Color = Color::Rgb(116, 199, 236); // #74c7ec sapphire
+
 pub fn rich_to_spans(segments: &[RichSegment]) -> Vec<Span<'static>> {
     segments.iter().map(|seg| {
         let mut style = Style::default();
         if seg.quote {
-            style = style.fg(Color::DarkGray);
+            style = style.fg(COLOR_QUOTE).add_modifier(Modifier::ITALIC);
         }
         if seg.bold {
             style = style.add_modifier(Modifier::BOLD);
@@ -102,17 +108,16 @@ pub fn rich_to_spans(segments: &[RichSegment]) -> Vec<Span<'static>> {
             style = style.add_modifier(Modifier::ITALIC);
         }
         if seg.mention {
-            style = style.fg(Color::Cyan).add_modifier(Modifier::BOLD);
+            style = style.fg(COLOR_MENTION).add_modifier(Modifier::BOLD);
         }
         if let Some(url) = &seg.link_url {
-            // Show as markdown-style link: [text](url)
             let text = seg.text.trim();
             let display = if text == url || text.is_empty() {
                 url.clone()
             } else {
                 format!("[{}]({})", text, url)
             };
-            return Span::styled(display, style.fg(Color::Blue).add_modifier(Modifier::UNDERLINED));
+            return Span::styled(display, style.fg(COLOR_LINK).add_modifier(Modifier::UNDERLINED));
         }
         Span::styled(seg.text.clone(), style)
     }).collect()
@@ -149,7 +154,10 @@ fn extract_quote(html: &str) -> (Option<String>, Option<String>) {
     }
 }
 
-/// Plain text strip (used for search indexing and simple display)
+/// Plain text strip (used for search indexing and simple display).
+/// Mentions are rendered as `@Name` prefix for each mention span.
+/// Teams gives each word of a name its own span (often with different itemid),
+/// so we just prefix each new mention span with `@`.
 fn strip_tags_plain(html: &str) -> String {
     let mut result = String::with_capacity(html.len());
     let mut in_tag = false;
@@ -293,6 +301,11 @@ fn strip_tags_rich(html: &str) -> Vec<RichSegment> {
                         in_mention = true;
                         pending_mention_at = true;
                         last_mention_id = mid;
+                    } else if !in_mention {
+                        // Same person, continuation span (e.g. multi-word name)
+                        // Merge gap text (spaces) into the previous mention segment
+                        // by keeping current_text as-is and re-entering mention mode
+                        in_mention = true;
                     }
                     mention_span_depth += 1;
                 }
@@ -370,10 +383,20 @@ fn strip_tags_rich(html: &str) -> Vec<RichSegment> {
               bold_depth > 0, italic_depth > 0, false, &link_url);
     }
 
-    // Collapse whitespace within each segment
+    // Collapse runs of whitespace within each segment but preserve
+    // leading/trailing spaces (they separate adjacent segments)
     for seg in segments.iter_mut() {
-        seg.text = collapse_whitespace(&seg.text);
+        seg.text = collapse_whitespace_inner(&seg.text);
     }
+    // Trim only the first and last segment
+    if let Some(first) = segments.first_mut() {
+        first.text = first.text.trim_start().to_string();
+    }
+    if let Some(last) = segments.last_mut() {
+        last.text = last.text.trim_end().to_string();
+    }
+    // Remove empty segments
+    segments.retain(|s| !s.text.is_empty());
 
     segments
 }
@@ -432,6 +455,27 @@ fn collapse_whitespace(s: &str) -> String {
         }
     }
     collapsed.trim().to_string()
+}
+
+/// Collapse runs of whitespace but preserve leading/trailing spaces.
+fn collapse_whitespace_inner(s: &str) -> String {
+    let mut collapsed = String::with_capacity(s.len());
+    let mut last_was_space = false;
+    for ch in s.chars() {
+        if ch == '\n' {
+            collapsed.push('\n');
+            last_was_space = false;
+        } else if ch.is_whitespace() {
+            if !last_was_space {
+                collapsed.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            collapsed.push(ch);
+            last_was_space = false;
+        }
+    }
+    collapsed
 }
 
 /// Quick tag stripping for search indexing (no quote handling)
@@ -541,10 +585,9 @@ mod tests {
         // Teams splits multi-word names into separate spans with same itemid
         let html = r#"<p>Hi <span itemtype="http://schema.skype.com/Mention" itemid="0">Vayalada</span> <span itemtype="http://schema.skype.com/Mention" itemid="0">Bhavani</span> <span itemtype="http://schema.skype.com/Mention" itemid="0">Shankar</span>, check this</p>"#;
         let result = strip_html(html);
-        assert_eq!(result.contains("@Vayalada"), true, "should have @ before first name: {}", result);
-        assert_eq!(result.contains("@Bhavani"), false, "should NOT have @ before middle name: {}", result);
-        assert_eq!(result.contains("@Shankar"), false, "should NOT have @ before last name: {}", result);
-        assert!(result.contains("@Vayalada Bhavani Shankar"), "got: {}", result);
+        assert!(result.contains("@Vayalada"), "should have mention: {}", result);
+        // Same itemid = same person, only one @ prefix
+        assert_eq!(result.matches('@').count(), 1, "should have exactly one @ prefix: {}", result);
     }
 
     #[test]
@@ -554,6 +597,17 @@ mod tests {
         let result = strip_html(html);
         assert!(result.contains("@Alice"), "got: {}", result);
         assert!(result.contains("@Bob"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_mention_different_ids_per_word() {
+        // Real Teams HTML: each word gets a different itemid even for the same person
+        let html = r#"<p>congratulating <span itemtype="http://schema.skype.com/Mention" itemid="1">Saurabh</span> <span itemtype="http://schema.skype.com/Mention" itemid="2">Rihan</span> and <span itemtype="http://schema.skype.com/Mention" itemid="3">Afzal</span> <span itemtype="http://schema.skype.com/Mention" itemid="4">Moideen</span> on their work</p>"#;
+        let result = strip_html(html);
+        assert!(result.contains("@Saurabh"), "got: {}", result);
+        assert!(result.contains("@Rihan"), "got: {}", result);
+        assert!(result.contains("@Afzal"), "got: {}", result);
+        assert!(result.contains("@Moideen"), "got: {}", result);
     }
 
     #[test]
@@ -571,6 +625,34 @@ mod tests {
         let lines = strip_html_rich(html);
         let segments: Vec<&RichSegment> = lines.iter().flat_map(|l| l.iter()).collect();
         assert!(segments.iter().any(|s| s.text.contains("this link") && s.link_url.is_some()), "link segment missing");
+    }
+
+    #[test]
+    fn test_rich_mention_multiword() {
+        // Multi-word name: all parts should be mention-styled, no duplicate @
+        let html = r#"<p>Hi <span itemtype="http://schema.skype.com/Mention" itemid="0">Trung</span> <span itemtype="http://schema.skype.com/Mention" itemid="0">Ly</span>, hello</p>"#;
+        let lines = strip_html_rich(html);
+        let segments: Vec<&RichSegment> = lines.iter().flat_map(|l| l.iter()).collect();
+        // Should have mention segments for "@Trung" and " Ly" (both mention=true)
+        let mention_segs: Vec<_> = segments.iter().filter(|s| s.mention).collect();
+        assert!(mention_segs.len() >= 1, "should have mention segments, got: {:?}", segments);
+        let mention_text: String = mention_segs.iter().map(|s| s.text.as_str()).collect();
+        assert!(mention_text.contains("@Trung"), "should have @Trung: {}", mention_text);
+        assert!(mention_text.contains("Ly"), "should have Ly: {}", mention_text);
+        // Should NOT have @Ly (no duplicate @)
+        assert!(!mention_text.contains("@Ly"), "should NOT have @Ly: {}", mention_text);
+    }
+
+    #[test]
+    fn test_rich_mention_spacing() {
+        // Spaces around mention should be preserved
+        let html = r#"<p>Hi <span itemtype="http://schema.skype.com/Mention" itemid="0">Sarah</span> check this</p>"#;
+        let lines = strip_html_rich(html);
+        let segments: Vec<&RichSegment> = lines.iter().flat_map(|l| l.iter()).collect();
+        // Reconstruct text and verify spacing
+        let full: String = segments.iter().map(|s| s.text.as_str()).collect();
+        assert!(full.contains("Hi "), "space before mention missing: '{}'", full);
+        assert!(full.contains(" check"), "space after mention missing: '{}'", full);
     }
 
     #[test]

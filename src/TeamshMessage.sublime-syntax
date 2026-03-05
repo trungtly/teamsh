@@ -1,0 +1,54 @@
+%YAML 1.2
+---
+name: Teams Message
+file_extensions:
+  - teamsmsg
+scope: source.teamsmsg
+
+contexts:
+  main:
+    # Separator lines (unicode box drawing)
+    - match: '^[─━═]+$'
+      scope: comment.line.teamsmsg
+
+    # NEW format: Sender + timestamp + optional #[channel] header line
+    # e.g. "Alice  2026 Mar 05 14:32  #[general]  " or "Bob  2026 Mar 05 14:32  "
+    - match: '^(\S.+?)\s{2,}(\d{4}\s+\w{3}\s+\d{2}\s+\d{2}:\d{2})(\s{2,}#\[[^\]]+\])?\s*$'
+      captures:
+        1: entity.name.function.sender.teamsmsg
+        2: constant.numeric.timestamp.teamsmsg
+        3: keyword.other.channel.teamsmsg
+
+    # OLD format: Timestamp + sender name line (e.g. "14:32 Name" or "Mar 05 14:32 Name")
+    - match: '^(\d{2}:\d{2}|\w{3}\s+\d{2}\s+\d{2}:\d{2})\s+(.+)$'
+      captures:
+        1: constant.numeric.timestamp.teamsmsg
+        2: entity.name.function.sender.teamsmsg
+
+    # Email headers (From:, Date:, Subject:)
+    - match: '^(From|Date|Subject):\s*(.*)'
+      captures:
+        1: keyword.other.teamsmsg
+        2: string.other.teamsmsg
+
+    # #[channel] tags in body text (bracketed)
+    - match: '#\[[^\]]+\]'
+      scope: keyword.other.channel.teamsmsg
+
+    # @mentions - single capitalized word (Teams gives each word its own mention span)
+    - match: '@[A-Z]\w*'
+      scope: markup.bold.mention.teamsmsg
+
+    # Quoted text (lines starting with >)
+    - match: '^\s*>.*$'
+      scope: comment.quote.teamsmsg
+
+    # URLs
+    - match: 'https?://[^\s\)>\]]+'
+      scope: markup.underline.link.teamsmsg
+
+    # Markdown-style links [text](url)
+    - match: '\[([^\]]+)\]\(([^\)]+)\)'
+      captures:
+        1: string.other.link.title.teamsmsg
+        2: markup.underline.link.teamsmsg
