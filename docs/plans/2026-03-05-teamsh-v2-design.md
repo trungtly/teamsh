@@ -113,13 +113,13 @@ Key interactions:
 
 **messages/{msg_id}.txt** -- plain text, human-readable, grep-friendly:
 ```
-14:32 Trung Ly
+14:32 Alice
   Hey, did you see the PR? I think we should merge before Friday.
 ```
 
 **emails/{folder}/{email_id}.txt** -- plain text email:
 ```
-From: Bob Smith <bob@6clicks.com>
+From: Bob Smith <bob@example.com>
 Date: 2026-03-05T10:30:00Z
 Subject: Re: PR #51
 
