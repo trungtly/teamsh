@@ -166,6 +166,7 @@ fn strip_tags_plain(html: &str) -> String {
     let mut tag_buf = String::new();
     let mut pending_mention = false;
     let mut last_mention_id = String::new();
+    let mut last_mention_end: Option<usize> = None; // position in result where last mention ended
 
     for ch in html.chars() {
         match ch {
@@ -185,7 +186,7 @@ fn strip_tags_plain(html: &str) -> String {
             }
             '&' if !in_tag => {
                 if pending_mention {
-                    result.push('@');
+                    emit_mention_prefix(&mut result, &mut last_mention_end);
                     pending_mention = false;
                 }
                 in_entity = true;
@@ -197,13 +198,20 @@ fn strip_tags_plain(html: &str) -> String {
             }
             _ if in_tag => {
                 tag_buf.push(ch);
+                // Track when mention span closes
+                if tag_buf == "/span" {
+                    // Mark end of mention content at current result position
+                    if last_mention_id != "" {
+                        last_mention_end = Some(result.len());
+                    }
+                }
             }
             _ if in_entity => {
                 entity.push(ch);
             }
             _ => {
                 if pending_mention {
-                    result.push('@');
+                    emit_mention_prefix(&mut result, &mut last_mention_end);
                     pending_mention = false;
                 }
                 result.push(ch);
@@ -212,6 +220,27 @@ fn strip_tags_plain(html: &str) -> String {
     }
 
     collapse_whitespace(&result)
+}
+
+/// Emit `@` or `-` depending on whether this mention immediately follows another.
+/// If text since last mention end is only whitespace, replace it with `-` (same person).
+fn emit_mention_prefix(result: &mut String, last_mention_end: &mut Option<usize>) {
+    if let Some(end_pos) = *last_mention_end {
+        let since = &result[end_pos..];
+        if !since.is_empty() && since.chars().all(|c| c.is_whitespace()) {
+            // Adjacent mention spans separated by whitespace = same person
+            result.truncate(end_pos);
+            result.push('-');
+            *last_mention_end = None;
+            return;
+        }
+    }
+    // New mention - add space if needed then @
+    if !result.is_empty() && !result.ends_with(|c: char| c.is_whitespace()) {
+        result.push(' ');
+    }
+    result.push('@');
+    *last_mention_end = None;
 }
 
 /// Rich text strip - returns formatting-aware segments
@@ -230,6 +259,7 @@ fn strip_tags_rich(html: &str) -> Vec<RichSegment> {
     let mut mention_span_depth = 0u32; // track nested spans within mention
     let mut last_mention_id = String::new();
     let mut pending_mention_at = false;
+    let mut last_mention_ended = false; // true when last mention span just closed
     let mut link_url: Option<String> = None;
 
     let flush = |segments: &mut Vec<RichSegment>, text: &mut String,
@@ -290,24 +320,39 @@ fn strip_tags_rich(html: &str) -> Vec<RichSegment> {
                 else if !is_close && tag_buf.contains("schema.skype.com/Mention") {
                     let mid = extract_attr(&tag_buf, "itemid");
                     if mid != last_mention_id {
-                        // New mention (different person)
+                        // Different itemid - could be new person or next word of same person
                         if in_mention {
                             flush(&mut segments, &mut current_text,
                                   bold_depth > 0, italic_depth > 0, true, &link_url);
+                            pending_mention_at = true;
                         } else {
-                            flush(&mut segments, &mut current_text,
-                                  bold_depth > 0, italic_depth > 0, false, &link_url);
+                            // Check if gap since last mention is only whitespace (same person)
+                            let is_adjacent = last_mention_ended
+                                && !current_text.is_empty()
+                                && current_text.chars().all(|c| c.is_whitespace());
+                            if is_adjacent {
+                                // Same person - replace whitespace gap with dash in previous mention segment
+                                if let Some(prev) = segments.last_mut() {
+                                    if prev.mention {
+                                        prev.text.push('-');
+                                    }
+                                }
+                                current_text.clear();
+                                pending_mention_at = false;
+                            } else {
+                                flush(&mut segments, &mut current_text,
+                                      bold_depth > 0, italic_depth > 0, false, &link_url);
+                                pending_mention_at = true;
+                            }
                         }
                         in_mention = true;
-                        pending_mention_at = true;
                         last_mention_id = mid;
                     } else if !in_mention {
                         // Same person, continuation span (e.g. multi-word name)
-                        // Merge gap text (spaces) into the previous mention segment
-                        // by keeping current_text as-is and re-entering mention mode
                         in_mention = true;
                     }
                     mention_span_depth += 1;
+                    last_mention_ended = false;
                 }
                 // Track span open/close for mention boundary detection
                 else if !is_close && tag_lower.starts_with("span") && in_mention {
@@ -320,7 +365,7 @@ fn strip_tags_rich(html: &str) -> Vec<RichSegment> {
                         flush(&mut segments, &mut current_text,
                               bold_depth > 0, italic_depth > 0, true, &link_url);
                         in_mention = false;
-                        // Don't clear last_mention_id yet - next span might be same person
+                        last_mention_ended = true;
                     }
                 }
                 // Any non-span, non-formatting opening tag closes mention
@@ -348,6 +393,9 @@ fn strip_tags_rich(html: &str) -> Vec<RichSegment> {
             }
             '&' if !in_tag => {
                 if pending_mention_at {
+                    if !current_text.is_empty() && !current_text.ends_with(|c: char| c.is_whitespace()) {
+                        current_text.push(' ');
+                    }
                     current_text.push('@');
                     pending_mention_at = false;
                 }
@@ -366,6 +414,9 @@ fn strip_tags_rich(html: &str) -> Vec<RichSegment> {
             }
             _ => {
                 if pending_mention_at {
+                    if !current_text.is_empty() && !current_text.ends_with(|c: char| c.is_whitespace()) {
+                        current_text.push(' ');
+                    }
                     current_text.push('@');
                     pending_mention_at = false;
                 }
@@ -575,17 +626,17 @@ mod tests {
 
     #[test]
     fn test_mention_prefix() {
-        let html = r#"<p>Hey <span itemtype="http://schema.skype.com/Mention" itemscope="" itemid="0">Ahmed</span>&nbsp;check this</p>"#;
+        let html = r#"<p>Hey <span itemtype="http://schema.skype.com/Mention" itemscope="" itemid="0">Dave</span>&nbsp;check this</p>"#;
         let result = strip_html(html);
-        assert!(result.contains("@Ahmed"), "got: {}", result);
+        assert!(result.contains("@Dave"), "got: {}", result);
     }
 
     #[test]
     fn test_mention_multiword_name() {
         // Teams splits multi-word names into separate spans with same itemid
-        let html = r#"<p>Hi <span itemtype="http://schema.skype.com/Mention" itemid="0">Vayalada</span> <span itemtype="http://schema.skype.com/Mention" itemid="0">Bhavani</span> <span itemtype="http://schema.skype.com/Mention" itemid="0">Shankar</span>, check this</p>"#;
+        let html = r#"<p>Hi <span itemtype="http://schema.skype.com/Mention" itemid="0">Jane</span> <span itemtype="http://schema.skype.com/Mention" itemid="0">Marie</span> <span itemtype="http://schema.skype.com/Mention" itemid="0">Smith</span>, check this</p>"#;
         let result = strip_html(html);
-        assert!(result.contains("@Vayalada"), "should have mention: {}", result);
+        assert!(result.contains("@Jane"), "should have mention: {}", result);
         // Same itemid = same person, only one @ prefix
         assert_eq!(result.matches('@').count(), 1, "should have exactly one @ prefix: {}", result);
     }
@@ -601,13 +652,13 @@ mod tests {
 
     #[test]
     fn test_mention_different_ids_per_word() {
-        // Real Teams HTML: each word gets a different itemid even for the same person
-        let html = r#"<p>congratulating <span itemtype="http://schema.skype.com/Mention" itemid="1">Saurabh</span> <span itemtype="http://schema.skype.com/Mention" itemid="2">Rihan</span> and <span itemtype="http://schema.skype.com/Mention" itemid="3">Afzal</span> <span itemtype="http://schema.skype.com/Mention" itemid="4">Moideen</span> on their work</p>"#;
+        // Teams gives each word of a name a different itemid
+        // Adjacent mention spans (only whitespace between) should be joined with -
+        let html = r#"<p>congratulating <span itemtype="http://schema.skype.com/Mention" itemid="1">John</span> <span itemtype="http://schema.skype.com/Mention" itemid="2">Doe</span> and <span itemtype="http://schema.skype.com/Mention" itemid="3">Jane</span> <span itemtype="http://schema.skype.com/Mention" itemid="4">Smith</span> on their work</p>"#;
         let result = strip_html(html);
-        assert!(result.contains("@Saurabh"), "got: {}", result);
-        assert!(result.contains("@Rihan"), "got: {}", result);
-        assert!(result.contains("@Afzal"), "got: {}", result);
-        assert!(result.contains("@Moideen"), "got: {}", result);
+        assert!(result.contains("@John-Doe"), "should join adjacent names: {}", result);
+        assert!(result.contains("@Jane-Smith"), "should join adjacent names: {}", result);
+        assert_eq!(result.matches('@').count(), 2, "should have exactly 2 mentions: {}", result);
     }
 
     #[test]
@@ -630,29 +681,50 @@ mod tests {
     #[test]
     fn test_rich_mention_multiword() {
         // Multi-word name: all parts should be mention-styled, no duplicate @
-        let html = r#"<p>Hi <span itemtype="http://schema.skype.com/Mention" itemid="0">Trung</span> <span itemtype="http://schema.skype.com/Mention" itemid="0">Ly</span>, hello</p>"#;
+        let html = r#"<p>Hi <span itemtype="http://schema.skype.com/Mention" itemid="0">Alice</span> <span itemtype="http://schema.skype.com/Mention" itemid="0">Wonder</span>, hello</p>"#;
         let lines = strip_html_rich(html);
         let segments: Vec<&RichSegment> = lines.iter().flat_map(|l| l.iter()).collect();
-        // Should have mention segments for "@Trung" and " Ly" (both mention=true)
         let mention_segs: Vec<_> = segments.iter().filter(|s| s.mention).collect();
         assert!(mention_segs.len() >= 1, "should have mention segments, got: {:?}", segments);
         let mention_text: String = mention_segs.iter().map(|s| s.text.as_str()).collect();
-        assert!(mention_text.contains("@Trung"), "should have @Trung: {}", mention_text);
-        assert!(mention_text.contains("Ly"), "should have Ly: {}", mention_text);
-        // Should NOT have @Ly (no duplicate @)
-        assert!(!mention_text.contains("@Ly"), "should NOT have @Ly: {}", mention_text);
+        assert!(mention_text.contains("@Alice"), "should have @Alice: {}", mention_text);
+        assert!(mention_text.contains("Wonder"), "should have Wonder: {}", mention_text);
+        // Should NOT have @Wonder (no duplicate @)
+        assert!(!mention_text.contains("@Wonder"), "should NOT have @Wonder: {}", mention_text);
     }
 
     #[test]
     fn test_rich_mention_spacing() {
         // Spaces around mention should be preserved
-        let html = r#"<p>Hi <span itemtype="http://schema.skype.com/Mention" itemid="0">Sarah</span> check this</p>"#;
+        let html = r#"<p>Hi <span itemtype="http://schema.skype.com/Mention" itemid="0">Carol</span> check this</p>"#;
         let lines = strip_html_rich(html);
         let segments: Vec<&RichSegment> = lines.iter().flat_map(|l| l.iter()).collect();
         // Reconstruct text and verify spacing
         let full: String = segments.iter().map(|s| s.text.as_str()).collect();
         assert!(full.contains("Hi "), "space before mention missing: '{}'", full);
         assert!(full.contains(" check"), "space after mention missing: '{}'", full);
+    }
+
+    #[test]
+    fn test_mention_no_space_before() {
+        // Mention directly after text (no space) should get a space inserted
+        // Adjacent mention spans should be joined with -
+        let html = r#"<p>results<span itemtype="http://schema.skype.com/Mention" itemid="0">Bob</span> <span itemtype="http://schema.skype.com/Mention" itemid="1">Jones</span></p>"#;
+        let result = strip_html(html);
+        assert!(result.contains("results @Bob-Jones"), "should join and space: {}", result);
+    }
+
+    #[test]
+    fn test_rich_mention_adjacent_different_ids() {
+        // Two adjacent mention spans with different itemids (same person, multi-word name)
+        // Both words should be mention-highlighted and joined with -
+        let html = r#"<p>thanks <span itemtype="http://schema.skype.com/Mention" itemid="0">Eve</span> <span itemtype="http://schema.skype.com/Mention" itemid="1">Parker</span>.</p>"#;
+        let lines = strip_html_rich(html);
+        let segments: Vec<&RichSegment> = lines.iter().flat_map(|l| l.iter()).collect();
+        let mention_segs: Vec<_> = segments.iter().filter(|s| s.mention).collect();
+        let mention_text: String = mention_segs.iter().map(|s| s.text.as_str()).collect();
+        assert!(mention_text.contains("@Eve-"), "should have @Eve-: {}", mention_text);
+        assert!(mention_text.contains("Parker"), "should have Parker highlighted: {}", mention_text);
     }
 
     #[test]

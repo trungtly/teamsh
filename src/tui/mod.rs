@@ -13,3 +13,12 @@ pub async fn run() -> Result<()> {
     ratatui::restore();
     result
 }
+
+pub async fn run_demo() -> Result<()> {
+    let mut terminal = ratatui::init();
+    execute!(std::io::stdout(), EnableMouseCapture)?;
+    let result = App::new_demo()?.run(&mut terminal).await;
+    execute!(std::io::stdout(), DisableMouseCapture)?;
+    ratatui::restore();
+    result
+}
