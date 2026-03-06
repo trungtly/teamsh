@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, ratatui + crossterm, clap (derive), reqwest (async/rustls), tokio, serde
 
-**Project dir:** `~/workspace/repos/trung-notes/shared/teamsh/`
+**Project dir:** `~/workspace/repos/teamsh/`
 
 ---
 
@@ -20,7 +20,7 @@
 
 **Step 1: Initialize cargo project**
 
-Run: `cd ~/workspace/repos/trung-notes/shared/teamsh && cargo init`
+Run: `cd ~/workspace/repos/teamsh && cargo init`
 
 **Step 2: Add dependencies to Cargo.toml**
 
@@ -54,7 +54,7 @@ fn main() {
 
 **Step 4: Verify it builds**
 
-Run: `cd ~/workspace/repos/trung-notes/shared/teamsh && cargo build`
+Run: `cd ~/workspace/repos/teamsh && cargo build`
 Expected: Compiles successfully (dependencies download on first build)
 
 **Step 5: Commit**
@@ -753,7 +753,7 @@ mod tests {
 
 **Step 3: Run tests**
 
-Run: `cd ~/workspace/repos/trung-notes/shared/teamsh && cargo test`
+Run: `cd ~/workspace/repos/teamsh && cargo test`
 Expected: All 5 tests pass
 
 **Step 4: Commit**
