@@ -66,8 +66,14 @@ impl Api {
             BASE_URL, self.region, encoded_id
         );
         let token = auth.access_token().await?;
+        // Wrap content in <p> tags if not already HTML
+        let html_content = if content.starts_with('<') {
+            content.to_string()
+        } else {
+            format!("<p>{}</p>", content)
+        };
         let body = serde_json::json!({
-            "content": content,
+            "content": html_content,
             "messagetype": "RichText/Html",
             "contenttype": "text",
         });
@@ -75,7 +81,6 @@ impl Api {
             .post(&url)
             .header("Authorization", format!("Bearer {}", token))
             .header("behavioroverride", "redirectAs404")
-            .header("x-ms-migration", "True")
             .json(&body)
             .send()
             .await?;

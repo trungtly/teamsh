@@ -48,7 +48,10 @@ async fn main() -> Result<()> {
         Some(Commands::Preview { path }) => {
             cmd_preview(path).await?;
         }
-        Some(Commands::Tui) | None => {
+        Some(Commands::Tui { demo }) if *demo => {
+            tui::run_demo().await?;
+        }
+        Some(Commands::Tui { .. }) | None => {
             tui::run().await?;
         }
     }
@@ -59,45 +62,70 @@ async fn main() -> Result<()> {
 async fn cmd_auth_init() -> Result<()> {
     println!("teamsh auth setup");
     println!();
-    println!("To get your refresh token:");
-    println!("1. Open https://teams.cloud.microsoft in browser");
-    println!("2. Open DevTools > Network tab");
-    println!("3. Filter for: login.microsoftonline.com");
-    println!("4. Find a POST to oauth2/v2.0/token");
-    println!("5. In Response, copy the refresh_token value");
-    println!();
-
-    let auth = auth::Auth::new()?;
-
-    println!("Enter your tenant ID (from the URL path, e.g. f2dbeea5-...):");
-    let mut tenant_id = String::new();
-    std::io::stdin().read_line(&mut tenant_id)?;
-    let tenant_id = tenant_id.trim();
-    if tenant_id.is_empty() {
-        anyhow::bail!("Tenant ID is required");
-    }
-
-    println!("Paste your refresh token:");
-    let mut refresh_token = String::new();
-    std::io::stdin().read_line(&mut refresh_token)?;
-    let refresh_token = refresh_token.trim();
-    if refresh_token.is_empty() {
-        anyhow::bail!("Refresh token is required");
-    }
-
-    println!("Enter your region (default: au):");
-    let mut region = String::new();
-    std::io::stdin().read_line(&mut region)?;
-    let region = region.trim();
-    let region = if region.is_empty() { "au" } else { region };
-
-    auth.save_init(refresh_token, tenant_id, region)?;
-    println!("Saved to {:?}", auth.config_dir());
 
     let mut auth = auth::Auth::new()?;
-    println!("Testing token refresh...");
-    auth.refresh().await?;
-    println!("Auth is working.");
+
+    // Check if tenant_id already exists
+    let existing_tenant = std::fs::read_to_string(auth.config_dir().join("tenant_id"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let tenant_id = if let Some(ref t) = existing_tenant {
+        println!("Using existing tenant: {}", t);
+        t.clone()
+    } else {
+        println!("Enter your tenant ID (from the URL path, e.g. f2dbeea5-...):");
+        println!("(leave empty to auto-detect from login)");
+        let mut tid = String::new();
+        std::io::stdin().read_line(&mut tid)?;
+        tid.trim().to_string()
+    };
+
+    // Set region if not already set
+    let region_path = auth.config_dir().join("region");
+    if !region_path.exists() {
+        println!("Enter your region (default: au):");
+        let mut region = String::new();
+        std::io::stdin().read_line(&mut region)?;
+        let region = region.trim();
+        let region = if region.is_empty() { "au" } else { region };
+        std::fs::write(&region_path, region)?;
+    }
+
+    // Login 1: Teams chat — must grab refresh token from browser (SPA limitation)
+    println!("=== Login 1/2: Teams (chat & messages) ===");
+    println!();
+    println!("The Teams API requires a browser token (SPA app, no device code).");
+    println!("1. Open https://teams.cloud.microsoft in your browser");
+    println!("2. Open DevTools (F12) > Network tab");
+    println!("3. Filter for: login.microsoftonline.com");
+    println!("4. Find a POST to oauth2/v2.0/token");
+    println!("5. In Response tab, copy the refresh_token value");
+    println!();
+    println!("Paste refresh token (or press Enter to skip if already valid):");
+    let mut rt_input = String::new();
+    std::io::stdin().read_line(&mut rt_input)?;
+    let rt_input = rt_input.trim();
+    if !rt_input.is_empty() {
+        std::fs::write(auth.config_dir().join("refresh_token"), rt_input)?;
+        // Verify
+        let mut test_auth = auth::Auth::new()?;
+        test_auth.refresh_teams().await?;
+        println!("Teams token OK!");
+    } else {
+        println!("Skipped (using existing token).");
+    }
+
+    // Login 2: Graph emails — device code flow (90 day token)
+    println!("\n=== Login 2/2: Emails (device code, ~90 day token) ===");
+    println!("Skip with Ctrl+C if already valid.");
+    match auth.login_graph(&tenant_id).await {
+        Ok(()) => {}
+        Err(e) => println!("Skipped: {}", e),
+    }
+
+    println!("\nDone! Teams token: ~24h. Email token: ~90 days.");
 
     Ok(())
 }
@@ -105,7 +133,7 @@ async fn cmd_auth_init() -> Result<()> {
 async fn cmd_auth_test() -> Result<()> {
     let mut auth = auth::Auth::new()?;
     println!("Refreshing token...");
-    auth.refresh().await?;
+    auth.refresh_teams().await?;
     println!("Token is valid.");
     Ok(())
 }
@@ -316,7 +344,9 @@ async fn cmd_sync() -> Result<()> {
                     }
                     let mid = m.id.as_deref().unwrap_or("unknown");
                     let ts = m.timestamp.as_deref().unwrap_or("");
-                    let sender = m.imdisplayname.as_deref().unwrap_or("?");
+                    let sender = m.imdisplayname.as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(if my_name.is_empty() { "?" } else { &my_name });
                     let content = m.content.as_deref().unwrap_or("");
                     store.save_message(&conv.id, mid, ts, sender, "", content)?;
                     msg_count += 1;

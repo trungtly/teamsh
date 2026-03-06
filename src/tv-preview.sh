@@ -62,7 +62,11 @@ if [ "$base" = "messages" ]; then
     done
 
     if [ "$highlight_line" -gt 0 ]; then
-        bat --language=teamsmsg --style=plain --color=always --paging=never --theme=teamsh --highlight-line="$highlight_line" "$tmp"
+        # Start a few lines before the match so it's visible in the preview
+        start=$((highlight_line - 5))
+        [ "$start" -lt 1 ] && start=1
+        bat --language=teamsmsg --style=plain --color=always --paging=never --theme=teamsh \
+            --highlight-line="$highlight_line" --line-range="${start}:" "$tmp"
     else
         bat --language=teamsmsg --style=plain --color=always --paging=never --theme=teamsh "$tmp"
     fi

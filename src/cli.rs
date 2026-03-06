@@ -78,7 +78,11 @@ pub enum Commands {
         path: String,
     },
     /// Launch TUI mode
-    Tui,
+    Tui {
+        /// Run with mock data (no API needed)
+        #[arg(long)]
+        demo: bool,
+    },
 }
 
 #[derive(Subcommand)]

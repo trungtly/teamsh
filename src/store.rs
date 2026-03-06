@@ -44,13 +44,23 @@ pub struct ConvMeta {
 
 // --- Shared formatting ---
 
-/// Format an ISO 8601 timestamp to "2026 Mar 05 14:32" style.
+/// Format an ISO 8601 timestamp to "2026 Mar 05 14:32" style in local timezone.
 /// Used by both file storage and TUI rendering for consistency.
 pub fn format_timestamp(ts: &str) -> String {
-    // Input: "2026-03-05T14:32:00.000Z"
+    // Input: "2026-03-05T14:32:00.5680000Z" (Teams uses up to 7 decimal places)
     if ts.len() < 16 {
         return "??:??".to_string();
     }
+    // Parse the datetime part manually since Teams uses non-standard fractional seconds
+    // Extract: "2026-03-05T14:32:00" (first 19 chars)
+    if let Some(dt_part) = ts.get(0..19) {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(dt_part, "%Y-%m-%dT%H:%M:%S") {
+            let utc = naive.and_utc();
+            let local = utc.with_timezone(&chrono::Local);
+            return local.format("%Y %b %d %H:%M").to_string();
+        }
+    }
+    // Fallback: manual parse (no timezone conversion)
     let year = ts.get(0..4).unwrap_or("????");
     let month = match ts.get(5..7) {
         Some("01") => "Jan", Some("02") => "Feb", Some("03") => "Mar",
@@ -414,22 +424,27 @@ mod tests {
 
     #[test]
     fn test_format_timestamp() {
-        assert_eq!(format_timestamp("2026-03-05T14:32:00.000Z"), "2026 Mar 05 14:32");
-        assert_eq!(format_timestamp("2026-12-25T08:00:00Z"), "2026 Dec 25 08:00");
+        // Timestamps are converted to local time, so check format not exact value
+        let result = format_timestamp("2026-03-05T14:32:00.000Z");
+        assert!(result.contains("2026"), "should have year: {}", result);
+        assert!(result.contains("Mar"), "should have month: {}", result);
+        assert!(result.contains(":"), "should have time separator: {}", result);
+        assert_eq!(format_timestamp("2026-12-25T08:00:00Z").contains("Dec"), true);
         assert_eq!(format_timestamp("short"), "??:??");
     }
 
     #[test]
     fn test_format_message() {
         let msg = format_message("Alice", "2026-03-05T14:32:00.000Z", "general", "Hello @Bob");
-        assert!(msg.starts_with("Alice  2026 Mar 05 14:32  #[general]"), "got: {}", msg);
+        assert!(msg.starts_with("Alice  2026 Mar"), "got: {}", msg);
+        assert!(msg.contains("#[general]"), "got: {}", msg);
         assert!(msg.contains("  Hello @Bob"), "got: {}", msg);
     }
 
     #[test]
     fn test_format_message_no_channel() {
         let msg = format_message("Alice", "2026-03-05T14:32:00.000Z", "", "Hello");
-        assert!(msg.starts_with("Alice  2026 Mar 05 14:32"), "got: {}", msg);
+        assert!(msg.starts_with("Alice  2026 Mar"), "got: {}", msg);
         assert!(!msg.contains('#'), "should have no channel tag: {}", msg);
     }
 
@@ -464,7 +479,7 @@ mod tests {
         let msgs = store.load_messages("c1").unwrap();
         assert_eq!(msgs.len(), 1);
         assert!(msgs[0].1.contains("Alice"), "should have sender: {}", msgs[0].1);
-        assert!(msgs[0].1.contains("2024 Jan 01 10:30"), "should have full timestamp: {}", msgs[0].1);
+        assert!(msgs[0].1.contains("2024 Jan"), "should have timestamp: {}", msgs[0].1);
         assert!(msgs[0].1.contains("#[general]"), "should have channel: {}", msgs[0].1);
         assert!(msgs[0].1.contains("@Bob"), "should have mention: {}", msgs[0].1);
 
