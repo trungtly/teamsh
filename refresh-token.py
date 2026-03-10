@@ -1,499 +1,493 @@
 #!/usr/bin/env python3
 """
-Refresh Teams token by launching Edge with an existing profile and
-intercepting the OAuth token response via CDP.
+Refresh both Teams and Graph tokens using agent-browser (Playwright CLI).
 
-On WSL: launches Windows Edge, queries CDP via PowerShell to intercept tokens.
-On native: uses Playwright directly.
+First run:  ./refresh-token.py --headed   (log in manually, SSO cookies saved)
+Later runs: ./refresh-token.py            (headless, auto-login via saved cookies)
 
-Usage:
-    python3 refresh-token.py [OPTIONS]
+How it works:
+  Teams token:
+    1. Opens Teams in Chromium with persistent profile
+    2. SSO cookies auto-login (or manual login if --headed)
+    3. Extracts refresh token from MSAL browser storage
+    4. Saves to ~/.config/teamsh/refresh_token
 
-Options:
-    --edge-path PATH       Path to Edge executable (auto-detected on WSL)
-    --profile-dir PATH     Edge User Data directory (auto-detected)
-    --profile-name NAME    Edge profile name (default: Default)
-    --config-dir PATH      Teamsh config directory (default: ~/.config/teamsh)
-    --timeout SECONDS      Max wait for token intercept (default: 120)
-    --debug-port PORT      CDP port (default: 9222)
+  Graph token:
+    5. Starts device code flow (HTTP POST to get user_code + device_code)
+    6. Navigates browser to microsoft.com/devicelogin
+    7. Auto-types user_code, clicks through approval
+    8. Polls token endpoint until Graph refresh token is received
+    9. Saves to ~/.config/teamsh/graph_refresh_token
 
-Cron example (every 20 hours):
-    0 */20 * * * python3 /path/to/refresh-token.py 2>> /tmp/teamsh-refresh.log
+Cron example (every 12 hours):
+    0 */12 * * * /path/to/refresh-token.py 2>> /tmp/teamsh-refresh.log
+
+Requirements: npx (Node.js), agent-browser (auto-installed via npx)
 """
 
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
+import threading
 import time
+import urllib.request
+import urllib.parse
 from pathlib import Path
 
 TEAMS_URL = "https://teams.cloud.microsoft"
-TOKEN_ENDPOINT = "login.microsoftonline.com"
-TOKEN_PATH = "/oauth2/v2.0/token"
-POWERSHELL = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+TEAMS_CLIENT_ID = "5e3ce6c0-2b1f-4285-8d4b-75ee78787346"
+GRAPH_CLIENT_ID = "d3590ed6-52b3-4102-aeff-aad2292ab01c"
+GRAPH_SCOPE = "https://graph.microsoft.com/.default openid profile offline_access"
+DEVICE_LOGIN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/devicecode"
+TOKEN_URL_TEMPLATE = "https://login.microsoftonline.com/{}/oauth2/v2.0/token"
+
+CONFIG_DIR = Path.home() / ".config" / "teamsh"
 
 
-def find_config_dir():
-    import platform
-    if platform.system() == "Linux":
-        xdg = Path.home() / ".config"
-    elif platform.system() == "Darwin":
-        xdg = Path.home() / "Library" / "Application Support"
+def ab(*args, profile=None, headed=False, capture=True):
+    """Run an agent-browser command."""
+    cmd = ["npx", "agent-browser"]
+    if profile:
+        cmd += ["--profile", str(profile)]
+    if headed:
+        cmd += ["--headed"]
+    cmd += list(args)
+
+    if capture:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        # Strip ANSI codes
+        import re
+        clean = re.sub(r'\x1b\[[0-9;]*m', '', result.stdout).strip()
+        return clean
     else:
-        xdg = Path.home() / ".config"
-    return xdg / "teamsh"
-
-
-def is_wsl():
-    try:
-        with open("/proc/version", "r") as f:
-            return "microsoft" in f.read().lower()
-    except FileNotFoundError:
-        return False
-
-
-def find_edge_path():
-    candidates = [
-        "/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
-        "/mnt/c/Program Files/Microsoft/Edge/Application/msedge.exe",
-    ]
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-    return None
-
-
-def find_windows_user():
-    users_dir = Path("/mnt/c/Users")
-    if not users_dir.exists():
+        subprocess.run(cmd, timeout=30)
         return None
-    skip = {"All Users", "Default", "Default User", "Public", "defaultuser0", "desktop.ini"}
-    for d in users_dir.iterdir():
-        if d.is_dir() and d.name not in skip:
-            edge_data = d / "AppData" / "Local" / "Microsoft" / "Edge" / "User Data"
-            try:
-                if edge_data.exists():
-                    return d.name
-            except PermissionError:
-                continue
-    return None
 
 
-def find_edge_profile_dir():
-    win_user = find_windows_user()
-    if not win_user:
-        return None
-    return Path(f"/mnt/c/Users/{win_user}/AppData/Local/Microsoft/Edge/User Data")
+def ab_eval(js, profile=None, headed=False):
+    """Run JavaScript via agent-browser eval --stdin."""
+    cmd = ["npx", "agent-browser"]
+    if profile:
+        cmd += ["--profile", str(profile)]
+    if headed:
+        cmd += ["--headed"]
+    cmd += ["eval", "--stdin"]
+
+    result = subprocess.run(cmd, input=js, capture_output=True, text=True, timeout=30)
+    import re
+    clean = re.sub(r'\x1b\[[0-9;]*m', '', result.stdout).strip()
+    return clean
 
 
-def wsl_to_windows_path(wsl_path: str) -> str:
-    try:
-        result = subprocess.run(
-            ["wslpath", "-w", wsl_path],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    if wsl_path.startswith("/mnt/c/"):
-        return "C:\\" + wsl_path[7:].replace("/", "\\")
-    return wsl_path
+def extract_teams_token(profile, headed, timeout):
+    """Extract Teams refresh token from MSAL browser storage."""
+    print("=== Teams Token ===")
+    print("Opening Teams...")
+    ab("open", TEAMS_URL, profile=profile, headed=headed)
 
+    # Wait for Teams to load past login page
+    print(f"Waiting for Teams to load (timeout: {timeout}s)...")
+    start = time.time()
+    logged_login = False
 
-def launch_edge_wsl(edge_path, profile_dir, profile_name, debug_port):
-    """Launch Windows Edge from WSL with remote debugging.
+    while time.time() - start < timeout:
+        url = ab("get", "url", profile=profile)
+        if not url:
+            time.sleep(2)
+            continue
 
-    Uses the real Edge profile (not a copy) so SSO cookies work.
-    Requires Edge to be fully closed first.
-    """
-    win_profile_dir = wsl_to_windows_path(str(profile_dir))
-
-    cmd = [
-        edge_path,
-        f"--remote-debugging-port={debug_port}",
-        f"--user-data-dir={win_profile_dir}",
-        f"--profile-directory={profile_name}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        TEAMS_URL,
-    ]
-
-    print(f"Launching Edge (profile: {profile_name}, CDP port: {debug_port})...")
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    return proc
-
-
-def ensure_edge_closed():
-    """Check if Edge is running and ask user to close it."""
-    result = ps_run("(Get-Process msedge -ErrorAction SilentlyContinue).Count")
-    if result and result.strip() != "0":
-        print("Edge is currently running. It must be closed to use the real profile with CDP.")
-        print("Close Edge now, or press Enter to force-close it.")
-        try:
-            input()
-        except EOFError:
-            pass
-        # Force close
-        ps_run("Stop-Process -Name msedge -Force -ErrorAction SilentlyContinue")
-        time.sleep(2)
-
-
-def ps_run(command, timeout=30):
-    """Run a PowerShell command and return stdout."""
-    try:
-        result = subprocess.run(
-            [POWERSHELL, "-NoProfile", "-Command", command],
-            capture_output=True, text=True, timeout=timeout,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-    return None
-
-
-def ps_cdp_query(port, path="/json/version"):
-    """Query CDP endpoint via PowerShell."""
-    raw = ps_run(f"(Invoke-WebRequest -Uri 'http://localhost:{port}{path}' -UseBasicParsing -TimeoutSec 5).Content")
-    if raw:
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            pass
-    return None
-
-
-def wait_for_cdp_wsl(port, timeout=20):
-    """Wait for CDP endpoint via PowerShell bridge."""
-    print(f"Waiting for Edge CDP on port {port}...")
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        data = ps_cdp_query(port)
-        if data and data.get("webSocketDebuggerUrl"):
-            print(f"CDP ready: {data.get('Browser', '?')}")
-            return True
-        time.sleep(1)
-    return False
-
-
-def poll_tokens_via_cdp(port, timeout, page_url=None):
-    """Use CDP protocol via PowerShell to enable network monitoring and
-    intercept OAuth token responses.
-
-    This is the core WSL approach: since Playwright can't reach Windows
-    localhost, we drive CDP entirely through PowerShell/Invoke-WebRequest.
-    """
-
-    # Step 1: Get list of pages/targets
-    targets = ps_cdp_query(port, "/json")
-    if not targets:
-        print("Error: could not list CDP targets.", file=sys.stderr)
-        return None, None
-
-    # Find a Teams page target
-    target_ws = None
-    for t in targets:
-        t_url = t.get("url", "")
-        if "teams" in t_url.lower() and t.get("type") == "page":
-            target_ws = t.get("webSocketDebuggerUrl")
-            print(f"Found Teams tab: {t_url[:80]}")
+        # Check if we're on Teams (not login page)
+        if "teams.cloud.microsoft" in url and "login.microsoftonline.com" not in url:
+            elapsed = int(time.time() - start)
+            print(f"Teams loaded ({elapsed}s)")
             break
 
-    if not target_ws:
-        # Navigate the first page to Teams
-        if targets and targets[0].get("type") == "page":
-            target_ws = targets[0].get("webSocketDebuggerUrl")
-            target_id = targets[0].get("id", "")
-            print("No Teams tab found, navigating...")
-            # Use CDP to navigate
-            ps_run(
-                f"Invoke-WebRequest -Uri 'http://localhost:{port}/json/activate/{target_id}' "
-                f"-Method PUT -UseBasicParsing -TimeoutSec 5",
-            )
+        # On login page
+        if "login.microsoftonline.com" in url:
+            if not headed:
+                print("Error: redirected to login. Run with --headed to log in manually.")
+                return None
+            if not logged_login:
+                print("  On login page - please log in in the browser window...")
+                logged_login = True
 
-    if not target_ws:
-        print("Error: no suitable page target.", file=sys.stderr)
-        return None, None
-
-    # Step 2: Use a PowerShell script that connects via WebSocket to CDP,
-    # enables Network domain, and watches for token responses.
-    # This is the most reliable approach for WSL.
-
-    ps_script = r"""
-$ErrorActionPreference = 'Stop'
-$wsUrl = '""" + target_ws.replace("'", "''") + r"""'
-$timeout = """ + str(timeout) + r"""
-
-# PowerShell 5.1 has System.Net.WebSockets
-$ws = New-Object System.Net.WebSockets.ClientWebSocket
-$ct = New-Object System.Threading.CancellationToken
-
-try {
-    $ws.ConnectAsync([uri]$wsUrl, $ct).Wait()
-} catch {
-    Write-Error "WebSocket connect failed: $_"
-    exit 1
-}
-
-# Helper to send CDP command
-function Send-CDP($id, $method, $params = @{}) {
-    $msg = @{ id = $id; method = $method; params = $params } | ConvertTo-Json -Compress -Depth 10
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($msg)
-    $segment = New-Object System.ArraySegment[byte] -ArgumentList @(,$bytes)
-    $ws.SendAsync($segment, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $ct).Wait()
-}
-
-# Helper to receive message
-function Recv-CDP() {
-    $buf = New-Object byte[] 1048576  # 1MB buffer
-    $segment = New-Object System.ArraySegment[byte] -ArgumentList @(,$buf)
-    $result = $ws.ReceiveAsync($segment, $ct).Result
-    if ($result.Count -gt 0) {
-        return [System.Text.Encoding]::UTF8.GetString($buf, 0, $result.Count)
-    }
-    return $null
-}
-
-# Enable Network monitoring and response body retrieval
-Send-CDP -id 1 -method 'Network.enable'
-
-# Navigate/reload to trigger token refresh
-Send-CDP -id 2 -method 'Page.reload'
-
-$deadline = (Get-Date).AddSeconds($timeout)
-$pendingRequestIds = @{}  # requestId -> url
-
-while ((Get-Date) -lt $deadline) {
-    try {
-        $raw = Recv-CDP
-        if (-not $raw) { continue }
-
-        $msg = $raw | ConvertFrom-Json -ErrorAction SilentlyContinue
-        if (-not $msg) { continue }
-
-        # Track requests to token endpoint
-        if ($msg.method -eq 'Network.requestWillBeSent') {
-            $url = $msg.params.request.url
-            if ($url -match 'login\.microsoftonline\.com' -and $url -match 'oauth2/v2\.0/token') {
-                $rid = $msg.params.requestId
-                $pendingRequestIds[$rid] = $url
-            }
-        }
-
-        # When response is received for a tracked request, get the body
-        if ($msg.method -eq 'Network.responseReceived') {
-            $rid = $msg.params.requestId
-            if ($pendingRequestIds.ContainsKey($rid)) {
-                # Request the response body
-                Send-CDP -id 100 -method 'Network.getResponseBody' -params @{ requestId = $rid }
-            }
-        }
-
-        # Check response to our getResponseBody call
-        if ($msg.id -eq 100 -and $msg.result) {
-            $bodyText = $msg.result.body
-            if ($bodyText) {
-                $body = $bodyText | ConvertFrom-Json -ErrorAction SilentlyContinue
-                if ($body -and $body.refresh_token) {
-                    # Output as JSON for the Python script to parse
-                    $output = @{
-                        refresh_token = $body.refresh_token
-                        url = ($pendingRequestIds.Values | Select-Object -First 1)
-                    } | ConvertTo-Json -Compress
-                    Write-Output $output
-                    break
-                }
-            }
-        }
-    } catch {
-        # Timeout or partial read, continue
-        Start-Sleep -Milliseconds 100
-    }
-}
-
-$ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, '', $ct).Wait()
-"""
-
-    print("Monitoring network via CDP (waiting for token refresh)...")
-    raw = ps_run(ps_script, timeout=timeout + 30)
-
-    if raw:
-        # Parse each line looking for our JSON output
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line or not line.startswith("{"):
-                continue
-            try:
-                data = json.loads(line)
-                token = data.get("refresh_token")
-                url = data.get("url", "")
-                tenant = None
-                if url:
-                    try:
-                        parts = url.split("/")
-                        idx = parts.index("oauth2") - 1
-                        if idx >= 0:
-                            tenant = parts[idx]
-                    except (ValueError, IndexError):
-                        pass
-                if token:
-                    return token, tenant
-            except json.JSONDecodeError:
-                continue
-
-    return None, None
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Refresh Teams token via Edge browser")
-    parser.add_argument("--edge-path", type=str, default=None,
-                        help="Path to Edge executable (auto-detected on WSL)")
-    parser.add_argument("--profile-dir", type=str, default=None,
-                        help="Edge User Data directory (auto-detected)")
-    parser.add_argument("--profile-name", type=str, default="Default",
-                        help="Edge profile name (default: Default)")
-    parser.add_argument("--config-dir", type=str, default=None,
-                        help="Teamsh config directory (default: ~/.config/teamsh)")
-    parser.add_argument("--timeout", type=int, default=120,
-                        help="Max seconds to wait for token (default: 120)")
-    parser.add_argument("--debug-port", type=int, default=9222,
-                        help="CDP remote debugging port (default: 9222)")
-    args = parser.parse_args()
-
-    config_dir = Path(args.config_dir) if args.config_dir else find_config_dir()
-    config_dir.mkdir(parents=True, exist_ok=True)
-
-    refresh_token_path = config_dir / "refresh_token"
-    tenant_id_path = config_dir / "tenant_id"
-
-    edge_path = args.edge_path
-    profile_dir = Path(args.profile_dir) if args.profile_dir else None
-
-    on_wsl = is_wsl()
-    edge_proc = None
-
-    if on_wsl:
-        if not edge_path:
-            edge_path = find_edge_path()
-        if not edge_path:
-            print("Error: Edge not found. Specify --edge-path.", file=sys.stderr)
-            sys.exit(1)
-
-        if not profile_dir:
-            profile_dir = find_edge_profile_dir()
-        if not profile_dir:
-            print("Error: Edge profile not found. Specify --profile-dir.", file=sys.stderr)
-            sys.exit(1)
-
-        ensure_edge_closed()
-        edge_proc = launch_edge_wsl(edge_path, profile_dir, args.profile_name, args.debug_port)
-
-        if not wait_for_cdp_wsl(args.debug_port):
-            print("Error: Edge did not expose CDP endpoint.", file=sys.stderr)
-            print("Close all Edge windows and try again, or use a different --debug-port.", file=sys.stderr)
-            edge_proc.terminate()
-            sys.exit(1)
-
-        # Use CDP via PowerShell (bypasses WSL2 network isolation)
-        captured_token, captured_tenant = poll_tokens_via_cdp(args.debug_port, args.timeout)
-
+        time.sleep(2)
     else:
-        # Native (macOS/Linux): use Playwright directly
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError:
-            print("Error: playwright not installed. Run: pip install playwright && playwright install chromium",
-                  file=sys.stderr)
-            sys.exit(1)
+        print("Error: timed out waiting for Teams to load.")
+        return None
 
-        captured_token = None
-        captured_tenant = None
+    # Let MSAL finish storing tokens
+    print("Waiting for MSAL token storage...")
+    time.sleep(5)
 
-        def handle_response(response):
-            nonlocal captured_token, captured_tenant
-            if captured_token:
-                return
-            url = response.url
-            if TOKEN_ENDPOINT not in url or TOKEN_PATH not in url:
-                return
+    # Extract refresh token from browser storage
+    print("Extracting token from browser storage...")
+    js = """(() => {
+    const results = [];
+    for (const store of [sessionStorage, localStorage]) {
+        for (let i = 0; i < store.length; i++) {
+            const key = store.key(i);
+            if (!key || !key.toLowerCase().includes('refreshtoken')) continue;
+            try {
+                const val = JSON.parse(store.getItem(key));
+                if (val && val.secret) {
+                    results.push({
+                        refresh_token: val.secret,
+                        client_id: val.clientId || null,
+                        tenant_id: val.realm || null,
+                    });
+                }
+            } catch(e) {}
+        }
+    }
+    return JSON.stringify(results);
+})()"""
+
+    raw = ab_eval(js, profile=profile, headed=headed)
+
+    # Parse JSON from output — agent-browser double-serializes:
+    # JS returns JSON.stringify(array) → agent-browser wraps in quotes → "[{\"key\":...}]"
+    tokens = None
+    # Try 1: parse as JSON string (unwraps one layer), then parse inner
+    try:
+        inner = json.loads(raw)
+        if isinstance(inner, str):
+            tokens = json.loads(inner)
+        elif isinstance(inner, list):
+            tokens = inner
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # Try 2: regex extract the array
+    if not tokens:
+        match = re.search(r'\[.*\]', raw, re.DOTALL)
+        if match:
             try:
-                body = response.json()
-            except Exception:
-                return
-            rt = body.get("refresh_token")
-            if not rt:
-                return
-            captured_token = rt
-            try:
-                parts = url.split("/")
-                idx = parts.index("oauth2") - 1
-                if idx >= 0:
-                    captured_tenant = parts[idx]
-            except (ValueError, IndexError):
+                tokens = json.loads(match.group())
+            except json.JSONDecodeError:
                 pass
-            print(f"Token captured! (tenant: {captured_tenant or 'unknown'})")
 
-        with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                str(profile_dir or config_dir / "browser"),
-                channel="msedge",
-                headless=False,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            teams_page = context.pages[0] if context.pages else context.new_page()
-            teams_page.on("response", handle_response)
-            teams_page.goto(TEAMS_URL, wait_until="domcontentloaded", timeout=30000)
-            teams_page.reload(wait_until="domcontentloaded", timeout=30000)
+    if not tokens:
+        print(f"Error: no tokens found in browser storage.")
+        print(f"  Raw output: {raw[:300]}")
+        return None
 
-            deadline = time.time() + args.timeout
-            while not captured_token and time.time() < deadline:
-                teams_page.wait_for_timeout(500)
-            context.close()
+    # Prefer the Teams SPA client token
+    teams_token = None
+    for t in tokens:
+        if t.get("client_id") == TEAMS_CLIENT_ID:
+            teams_token = t
+            break
+    if not teams_token:
+        teams_token = tokens[0]
 
-    # Clean up Edge
-    if edge_proc:
-        edge_proc.terminate()
-        try:
-            edge_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            edge_proc.kill()
-
-    if not captured_token:
-        print("Error: timed out waiting for token.", file=sys.stderr)
-        print("Make sure you're logged into Teams in Edge.", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Token captured! (tenant: {captured_tenant or 'unknown'})")
+    refresh_token = teams_token["refresh_token"]
+    tenant_id = teams_token.get("tenant_id")
 
     # Save
-    refresh_token_path.write_text(captured_token)
-    print(f"Saved refresh_token to {refresh_token_path}")
+    (CONFIG_DIR / "refresh_token").write_text(refresh_token)
+    print(f"Saved Teams refresh_token ({len(refresh_token)} chars)")
 
-    if captured_tenant and captured_tenant != "organizations":
-        tenant_id_path.write_text(captured_tenant)
-        print(f"Saved tenant_id to {tenant_id_path}")
+    if tenant_id and tenant_id not in ("organizations", "common"):
+        (CONFIG_DIR / "tenant_id").write_text(tenant_id)
+        print(f"Saved tenant_id: {tenant_id}")
 
-    # Verify
+    return True
+
+
+def get_tenant_id():
+    """Load tenant_id from config."""
+    path = CONFIG_DIR / "tenant_id"
+    if path.exists():
+        tid = path.read_text().strip()
+        if tid:
+            return tid
+    return "organizations"
+
+
+def start_device_code_flow(tenant_id):
+    """Start OAuth2 device code flow for Graph API."""
+    data = urllib.parse.urlencode({
+        "client_id": GRAPH_CLIENT_ID,
+        "scope": GRAPH_SCOPE,
+    }).encode()
+
+    url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/devicecode"
+    req = urllib.request.Request(url, data=data, method="POST")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
+
+
+def poll_device_code_token(tenant_id, device_code, interval, timeout):
+    """Poll token endpoint until device code flow completes."""
+    url = TOKEN_URL_TEMPLATE.format(tenant_id)
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        time.sleep(interval)
+        data = urllib.parse.urlencode({
+            "client_id": GRAPH_CLIENT_ID,
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "device_code": device_code,
+            "scope": GRAPH_SCOPE,
+        }).encode()
+
+        req = urllib.request.Request(url, data=data, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = json.loads(resp.read())
+                return body
+        except urllib.error.HTTPError as e:
+            body = json.loads(e.read())
+            error = body.get("error", "")
+            if error == "authorization_pending":
+                continue
+            elif error == "slow_down":
+                interval += 5
+                continue
+            elif error == "expired_token":
+                print("Error: device code expired.")
+                return None
+            else:
+                desc = body.get("error_description", "")
+                print(f"Error: {error} - {desc}")
+                return None
+
+    print("Error: timed out polling for Graph token.")
+    return None
+
+
+def click_by_snapshot(profile, label_keywords):
+    """Use accessibility snapshot to find and click a button by keyword."""
+    snap = ab("snapshot", "-i", profile=profile)
+    if not snap:
+        return False, ""
+
+    # Look for refs like @e3 next to matching text
+    import re
+    for line in snap.splitlines():
+        line_lower = line.lower()
+        for kw in label_keywords:
+            if kw in line_lower:
+                ref_match = re.search(r'@e\d+', line)
+                if ref_match:
+                    ref = ref_match.group()
+                    ab("click", ref, profile=profile)
+                    return True, snap
+    return False, snap
+
+
+def extract_graph_token(profile, headed, timeout):
+    """Get Graph refresh token via device code flow automated in the browser."""
+    print("\n=== Graph Token ===")
+
+    tenant_id = get_tenant_id()
+
+    # Start device code flow
+    print("Starting device code flow...")
+    try:
+        device = start_device_code_flow(tenant_id)
+    except Exception as e:
+        print(f"Error starting device code flow: {e}")
+        return False
+
+    user_code = device["user_code"]
+    device_code = device["device_code"]
+    interval = device.get("interval", 5)
+
+    print(f"User code: {user_code}")
+
+    # Start polling in a background thread so browser interaction isn't blocked
+    token_result = [None]
+
+    def poll_thread():
+        token_result[0] = poll_device_code_token(tenant_id, device_code, interval, timeout)
+
+    poller = threading.Thread(target=poll_thread, daemon=True)
+    poller.start()
+
+    # Navigate to device login
+    login_url = device.get("verification_uri", "https://login.microsoft.com/device")
+    print(f"Navigating to {login_url}...")
+    ab("open", login_url, profile=profile, headed=headed)
+    time.sleep(3)
+
+    # Step 1: Enter the user code
+    # Use snapshot to find the input field
+    print(f"Entering code: {user_code}")
+    snap = ab("snapshot", "-i", profile=profile)
+    print(f"  Page: {snap[:200]}")
+
+    # Try filling by common selectors, then fallback to snapshot ref
+    filled = False
+    for selector in ["input#otc", "input[name='otc']", "input"]:
+        result = ab("fill", selector, user_code, profile=profile)
+        # Check if fill worked (agent-browser doesn't error on bad selectors,
+        # but returns empty or error text)
+        if result is not None and "error" not in result.lower():
+            filled = True
+            break
+
+    if not filled:
+        # Try via snapshot ref
+        for line in snap.splitlines():
+            if "textbox" in line.lower() or "input" in line.lower():
+                ref_match = re.search(r'@e\d+', line)
+                if ref_match:
+                    ab("fill", ref_match.group(), user_code, profile=profile)
+                    filled = True
+                    break
+
+    time.sleep(1)
+
+    # Step 2: Click Next
+    print("Clicking Next...")
+    ab("click", "input#idSIButton9", profile=profile)
+    time.sleep(3)
+
+    # Step 3: Handle approval pages
+    # Microsoft shows multiple screens: account picker, consent, etc.
+    # Keep clicking through until done or timed out
+    print("Completing approval flow...")
+    deadline = time.time() + 60  # 60s for the approval part
+
+    while time.time() < deadline:
+        # Check if poller already got the token
+        if token_result[0] is not None:
+            print("Token received!")
+            break
+
+        url = ab("get", "url", profile=profile)
+        snap = ab("snapshot", "-i", profile=profile)
+        snap_lower = (snap or "").lower()
+
+        print(f"  URL: {(url or '')[:80]}")
+        if snap:
+            # Print first few lines of snapshot for debugging
+            snap_lines = snap.strip().splitlines()[:5]
+            for sl in snap_lines:
+                print(f"    {sl}")
+
+        # Success page
+        if snap and ("you have signed in" in snap_lower or "you're all set" in snap_lower
+                      or "you may close" in snap_lower):
+            print("  Approval complete!")
+            break
+
+        # Error
+        if snap and ("error" in snap_lower and "expired" in snap_lower):
+            print(f"  Error on page: {snap[:200]}")
+            break
+
+        # Try clicking interactive elements on the page
+        clicked = False
+        if snap:
+            for line in snap.splitlines():
+                line_lower = line.lower()
+                # Account picker: "Sign in with ... account"
+                if "sign in with" in line_lower:
+                    ref_match = re.search(r'\[ref=(e\d+)\]', line)
+                    if ref_match:
+                        ref = f"@{ref_match.group(1)}"
+                        print(f"  Clicking account: {line.strip()}")
+                        ab("click", ref, profile=profile)
+                        clicked = True
+                        break
+                # Continue/Accept/Yes buttons
+                for kw in ["continue", "accept", "yes"]:
+                    if kw in line_lower and "button" in line_lower:
+                        ref_match = re.search(r'\[ref=(e\d+)\]', line)
+                        if ref_match:
+                            ref = f"@{ref_match.group(1)}"
+                            print(f"  Clicking: {line.strip()}")
+                            ab("click", ref, profile=profile)
+                            clicked = True
+                            break
+                if clicked:
+                    break
+
+        if clicked:
+            time.sleep(3)
+        else:
+            time.sleep(3)
+
+    # Wait for poller to finish (give it a bit more time)
+    print("Waiting for token polling to complete...")
+    poller.join(timeout=30)
+
+    if not token_result[0] or "refresh_token" not in token_result[0]:
+        print("Error: did not receive Graph refresh token.")
+        return False
+
+    # Save
+    (CONFIG_DIR / "graph_refresh_token").write_text(token_result[0]["refresh_token"])
+    print(f"Saved Graph refresh_token ({len(token_result[0]['refresh_token'])} chars)")
+
+    return True
+
+
+def verify_tokens():
+    """Verify tokens work by refreshing them via teamsh."""
+    print("\n=== Verification ===")
     try:
         result = subprocess.run(
             ["teamsh", "auth", "test"],
             capture_output=True, text=True, timeout=15,
         )
         if result.returncode == 0:
-            print("Token verified OK!")
+            print("Teams token: OK")
         else:
-            print(f"Warning: token verify failed: {result.stderr.strip()}")
+            print(f"Teams token: FAILED ({result.stderr.strip()})")
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+        print("Teams token: skipped (teamsh not in PATH)")
 
-    print("Done.")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Refresh Teams and Graph tokens via browser automation"
+    )
+    parser.add_argument("--headed", action="store_true",
+                        help="Show browser window (required for first login)")
+    parser.add_argument("--timeout", type=int, default=120,
+                        help="Max wait in seconds per token (default: 120)")
+    parser.add_argument("--teams-only", action="store_true",
+                        help="Only refresh Teams token")
+    parser.add_argument("--graph-only", action="store_true",
+                        help="Only refresh Graph token")
+    args = parser.parse_args()
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    profile = CONFIG_DIR / "browser-profile"
+    ok = True
+
+    try:
+        if not args.graph_only:
+            if not extract_teams_token(profile, args.headed, args.timeout):
+                print("Teams token refresh FAILED.")
+                ok = False
+
+        if not args.teams_only:
+            if not extract_graph_token(profile, args.headed, args.timeout):
+                print("Graph token refresh FAILED.")
+                ok = False
+
+        if ok:
+            verify_tokens()
+            print("\nDone. Both tokens refreshed.")
+        else:
+            print("\nDone with errors.")
+    finally:
+        # Close browser
+        print("Closing browser...")
+        try:
+            ab("close", profile=profile)
+        except Exception:
+            pass
+
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

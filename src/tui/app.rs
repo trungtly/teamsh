@@ -43,6 +43,7 @@ pub struct App {
     exit: bool,
 
     // Sidebar
+    sidebar_width_pct: u16,
     conversations: Vec<Conversation>,
     sidebar_items: Vec<SidebarItem>,
     sidebar_state: ListState,
@@ -134,6 +135,7 @@ impl App {
             store,
             focus: Focus::Sidebar,
             exit: false,
+            sidebar_width_pct: 25,
             conversations: Vec::new(),
             sidebar_items: Vec::new(),
             sidebar_state: ListState::default(),
@@ -251,6 +253,7 @@ impl App {
             store,
             focus: Focus::Sidebar,
             exit: false,
+            sidebar_width_pct: 25,
             conversations,
             sidebar_items: Vec::new(),
             sidebar_state: ListState::default(),
@@ -420,10 +423,10 @@ impl App {
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
 
-        // Split: sidebar (25%) | main (75%)
+        // Split: sidebar | main (adjustable with < / >)
         let [sidebar_area, main_area] = Layout::horizontal([
-            Constraint::Percentage(25),
-            Constraint::Percentage(75),
+            Constraint::Percentage(self.sidebar_width_pct),
+            Constraint::Percentage(100 - self.sidebar_width_pct),
         ]).areas(area);
 
         self.sidebar_area = sidebar_area;
@@ -520,13 +523,6 @@ impl App {
                             .unwrap_or("");
                         let is_current = self.current_email_id.as_deref() == Some(email_id);
 
-                        // Truncate subject for sidebar
-                        let label = if subject.len() > 30 {
-                            format!("{}..", &subject[..28])
-                        } else {
-                            subject.to_string()
-                        };
-
                         let email_marker = if !is_read { "\u{25cf} " } else { "  " };
                         let line = if is_current {
                             Line::from(vec![
@@ -536,7 +532,7 @@ impl App {
                                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                                 ),
                                 Span::styled(
-                                    label,
+                                    subject.to_string(),
                                     Style::default().fg(Color::Cyan),
                                 ),
                             ])
@@ -548,7 +544,7 @@ impl App {
                                     Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
                                 ),
                                 Span::styled(
-                                    label,
+                                    subject.to_string(),
                                     Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
                                 ),
                             ])
@@ -559,7 +555,7 @@ impl App {
                                     format!("{} ", from),
                                     Style::default().fg(Color::DarkGray),
                                 ),
-                                Span::raw(label),
+                                Span::raw(subject.to_string()),
                             ])
                         };
                         items.push(ListItem::new(line));
@@ -868,9 +864,9 @@ impl App {
                 }
                 _ => {
                     if !self.sidebar_filter.is_empty() {
-                        " j/k:nav  n/N:next/prev  s:new search  Tab:section  Enter:open  Space:fav  q:quit "
+                        " j/k:nav  n/N:next/prev  s:new search  Tab:section  Enter:open  Space:fav  </>:resize  q:quit "
                     } else {
-                        " j/k:nav  Tab:section  Enter:open  Space:fav  s:search  /:tv  r:refresh  L:login  q:quit "
+                        " j/k:nav  Tab:section  Enter:open  Space:fav  s:search  /:tv  </>:resize  r:refresh  L:login  q:quit "
                     }
                 }
             };
@@ -1096,6 +1092,18 @@ impl App {
                 KeyCode::Char('N') => {
                     self.jump_sidebar_to_filter_prev();
                     self.preview_selected().await;
+                }
+                KeyCode::Char('<') => {
+                    if self.sidebar_width_pct > 15 {
+                        self.sidebar_width_pct -= 5;
+                    }
+                    self.render_dirty = true;
+                }
+                KeyCode::Char('>') => {
+                    if self.sidebar_width_pct < 50 {
+                        self.sidebar_width_pct += 5;
+                    }
+                    self.render_dirty = true;
                 }
                 _ => {}
             },

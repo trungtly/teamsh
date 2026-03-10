@@ -183,6 +183,18 @@ fn strip_tags_plain(html: &str) -> String {
                         last_mention_id = mid;
                     }
                 }
+                // Insert newline for block-level HTML elements
+                let tag_lower = tag_buf.to_lowercase();
+                let tag_name = tag_lower.split_whitespace().next().unwrap_or("");
+                let tag_name = tag_name.trim_start_matches('/');
+                if matches!(tag_name, "br" | "p" | "div" | "tr" | "hr" | "li"
+                    | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+                    | "table" | "blockquote" | "pre")
+                {
+                    if !result.ends_with('\n') {
+                        result.push('\n');
+                    }
+                }
             }
             '&' if !in_tag => {
                 if pending_mention {
