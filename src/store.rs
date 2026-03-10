@@ -123,7 +123,7 @@ impl Store {
     fn ensure_tv_assets(&self, config_dir: &Path) -> Result<()> {
         // tv preview script
         let script = config_dir.join("tv-preview.sh");
-        fs::write(&script, include_str!("../tv-preview.sh"))?;
+        fs::write(&script, include_str!("../scripts/tv-preview.sh"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -140,8 +140,8 @@ impl Store {
 
             let syntax_file = syntax_dir.join("TeamshMessage.sublime-syntax");
             let theme_file = theme_dir.join("teamsh.tmTheme");
-            let new_syntax = include_str!("../TeamshMessage.sublime-syntax");
-            let new_theme = include_str!("../teamsh.tmTheme");
+            let new_syntax = include_str!("TeamshMessage.sublime-syntax");
+            let new_theme = include_str!("teamsh.tmTheme");
 
             let syntax_changed = fs::read_to_string(&syntax_file)
                 .map(|old| old != new_syntax)

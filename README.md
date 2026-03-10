@@ -2,114 +2,123 @@
 
 A terminal-based Microsoft Teams client with both CLI and TUI modes.
 
-## Features
+## Install
 
-- **TUI mode** (default): Full-screen ratatui interface with sidebar, message view, and input
-  - Collapsible sections: Favourites, Activity, DMs, Channels, Meetings, Emails
-  - Sidebar search with `s`/`f`, navigate matches with `n`/`N`
-  - In-thread search with `/`
-  - Full-text search via [tv](https://github.com/alexpasmantier/television) integration (`T`)
-  - Mouse support (click, scroll, text selection + copy)
-  - Syntax-highlighted messages via bat
-  - Keyboard-driven: vim-style navigation (`j`/`k`/`g`/`G`), accelerated scrolling
-  - New message polling with bell notification
-  - Re-login with `L` when token expires
+```bash
+cargo build --release
+cp target/release/teamsh ~/.local/bin/   # or anywhere in PATH
+```
 
-- **CLI mode**: Subcommands for scripting and automation
-  - `teamsh chats` -- list conversations (JSON or plain)
-  - `teamsh messages <id>` -- fetch messages from a conversation
-  - `teamsh send <id> -m "text"` -- send a message
-  - `teamsh search <query>` -- search people
-  - `teamsh emails` -- list inbox emails
-  - `teamsh sync` -- sync all data to local files (grep-friendly plain text)
-  - `teamsh green` -- set presence to Available
-
-- **Email** via Microsoft Graph API (separate 90-day token)
-
-- **Local file store** for offline access and full-text search
+Optional tools for enhanced experience:
+- [bat](https://github.com/sharkdp/bat) -- syntax-highlighted message rendering
+- [tv](https://github.com/alexpasmantier/television) -- full-text search across synced messages
 
 ## Authentication
 
-teamsh uses two OAuth tokens:
+teamsh uses two OAuth tokens to access Microsoft Teams and Outlook:
 
-| Token | Client | Lifetime | Method |
-|-------|--------|----------|--------|
-| Teams (chat) | Teams SPA (`5e3ce6c0`) | ~24 hours | Manual paste from browser DevTools |
-| Graph (email) | Office native (`d3590ed6`) | ~90 days | Device code flow (browser opens automatically) |
+| Token | Purpose | Lifetime | Setup |
+|-------|---------|----------|-------|
+| Teams | Chat, messages, presence | ~24 hours | Paste refresh token from browser |
+| Graph | Email via Microsoft Graph | ~90 days | Device code flow (browser opens) |
 
-### Setup
+### Initial Setup
 
 ```bash
 teamsh auth init
 ```
 
-This runs a two-step login:
-1. **Teams token**: Paste a refresh token from browser DevTools (see prompts)
-2. **Email token**: Device code flow -- a browser opens, you approve, done
+This walks you through two steps:
 
-### Auto-refresh (WSL)
+**Step 1 -- Teams token (manual, one-time):**
+1. Open https://teams.cloud.microsoft in your browser
+2. Open DevTools (F12) > Network tab
+3. Filter for `login.microsoftonline.com`
+4. Find a POST to `oauth2/v2.0/token`
+5. In the Response tab, copy the `refresh_token` value
+6. Paste it when prompted
 
-`refresh-token.py` can automatically refresh the Teams token by launching Edge with your existing profile:
+**Step 2 -- Graph token (automatic):**
+1. A browser opens to Microsoft's device login page
+2. Enter the code shown in the terminal
+3. Approve the login
 
-```bash
-# First run: opens Edge for login
-python3 refresh-token.py --headed
+### Keeping Tokens Fresh
 
-# Subsequent runs: headless via CDP
-python3 refresh-token.py
+The Teams token expires after ~24h of inactivity. The Graph token lasts ~90 days. Both auto-rotate on each use, so regular usage keeps them alive.
 
-# Cron every 20 hours
-0 */20 * * * python3 /path/to/refresh-token.py 2>> /tmp/teamsh-refresh.log
-```
-
-Requires: `pip install playwright && playwright install chromium`
-
-## Build
+For unattended operation, use the auto-refresh script:
 
 ```bash
-cargo build --release
-# Binary at target/release/teamsh
+# First run: opens a browser for manual login (saves SSO cookies)
+./scripts/refresh-token.py --headed
+
+# Subsequent runs: headless, uses saved SSO cookies
+./scripts/refresh-token.py
+
+# Cron: refresh both tokens every 12 hours
+0 */12 * * * /path/to/scripts/refresh-token.py 2>> /tmp/teamsh-refresh.log
 ```
 
-## Dependencies
+Requires: `npx` (Node.js). The script uses `agent-browser` (auto-installed via npx).
 
-- Rust 2021 edition
-- [ratatui](https://ratatui.rs/) + crossterm (TUI)
-- reqwest + tokio (async HTTP)
-- clap (CLI parsing)
-- Optional: [tv](https://github.com/alexpasmantier/television) (full-text search), [bat](https://github.com/sharkdp/bat) (syntax highlighting)
+Options: `--teams-only`, `--graph-only`, `--timeout N`
 
-## Key Bindings (TUI)
+## Usage
+
+### TUI Mode (default)
+
+```bash
+teamsh
+```
+
+Full-screen terminal UI with sidebar navigation, message view, and compose input.
+
+#### Key Bindings
 
 | Key | Action |
 |-----|--------|
 | `j`/`k` or arrows | Navigate sidebar / scroll messages |
 | `Enter` | Select conversation / send message |
-| `s` or `f` | Sidebar search |
+| `s` or `f` | Search sidebar |
 | `n`/`N` | Next/previous search match |
 | `/` | Search within current thread |
-| `T` | Full-text search (tv) |
-| `i` | Focus input |
-| `Esc` | Back to sidebar |
+| `T` | Full-text search via tv |
+| `i` | Focus message input |
+| `Tab` | Jump between sidebar sections |
+| `Space` | Toggle favourite |
+| `<`/`>` | Resize sidebar |
 | `g`/`G` | Jump to top/bottom |
-| `Tab` | Toggle sidebar sections |
-| `F` | Toggle favourite |
 | `r` | Refresh conversations |
-| `L` | Re-login (token expired) |
+| `L` | Re-login (when token expires) |
+| `Esc` | Back to sidebar |
 | `q` | Quit |
 
-## Architecture
+### CLI Mode
+
+```bash
+teamsh chats                      # List conversations
+teamsh chats --channels           # Channels only
+teamsh chats --dms                # DMs only
+teamsh messages <conv-id>         # Fetch messages
+teamsh messages <conv-id> --plain # Plain text (no HTML)
+teamsh send <conv-id> -m "hello"  # Send a message
+teamsh search <query>             # Search people
+teamsh emails                     # List inbox
+teamsh sync                       # Sync all to local files
+teamsh green [--hours N] [--keep] # Set status to Available
+teamsh list                       # List synced conversations
+```
+
+Add `--format json` for JSON output.
+
+### Local File Store
+
+`teamsh sync` saves all conversations and emails as plain text files under `~/.config/teamsh/data/`. These are grep-friendly and searchable with standard Unix tools or the `T` key in TUI mode.
+
+## Project Structure
 
 ```
-src/
-  main.rs    -- CLI entry point, subcommands
-  auth.rs    -- Dual OAuth token management
-  api.rs     -- Teams chatsvc + Graph API client
-  types.rs   -- Shared data types (Conversation, Message, etc.)
-  html.rs    -- HTML to plain text + styled spans
-  cache.rs   -- Binary cache for fast TUI startup
-  store.rs   -- Local file store (plain text, grep-friendly)
-  tui/
-    mod.rs   -- Terminal setup, run loop
-    app.rs   -- TUI state, rendering, key handling
+src/           Rust source (compiled binary)
+scripts/       Token refresh and tv integration scripts
 ```

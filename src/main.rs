@@ -75,7 +75,7 @@ async fn cmd_auth_init() -> Result<()> {
         println!("Using existing tenant: {}", t);
         t.clone()
     } else {
-        println!("Enter your tenant ID (from the URL path, e.g. f2dbeea5-...):");
+        println!("Enter your tenant ID (from the URL path, e.g. xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx):");
         println!("(leave empty to auto-detect from login)");
         let mut tid = String::new();
         std::io::stdin().read_line(&mut tid)?;
